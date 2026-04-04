@@ -22,6 +22,9 @@ import { AttachmentBuilder } from 'discord.js';
 const DATA_DIR = join(process.cwd(), 'data');
 const MINUTES_DIR = join(DATA_DIR, 'minutes');
 
+/** SLA timeout for the full minutes generation pipeline (2 minutes) */
+const GENERATION_TIMEOUT_MS = 2 * 60 * 1000;
+
 /**
  * @typedef {Object} GeneratorInput
  * @property {Array<Object>} transcript     - Transcript entries from the session
@@ -58,95 +61,33 @@ export async function generateAndDeliverMinutes(input) {
   const guild = client?.guilds?.cache?.get(session.guildId);
   const textChannel = guild?.channels?.cache?.get(session.textChannelId);
 
+  // SLA watchdog: if the pipeline stalls beyond GENERATION_TIMEOUT_MS, abort and notify
+  let timeoutHandle;
+  const timeoutPromise = new Promise((_resolve, reject) => {
+    timeoutHandle = setTimeout(() => {
+      reject(new Error(`Minutes generation timed out after ${GENERATION_TIMEOUT_MS / 1000}s`));
+    }, GENERATION_TIMEOUT_MS);
+  });
+
   try {
-    // --- Step 1: Build metadata for the formatter ---
-    const metadata = buildMetadata(session, transcriptResult, guild, duration);
-
-    // Use transcript from coordinator result if available, otherwise session transcript
-    const transcriptEntries = transcriptResult?.transcript ?? transcript ?? session.transcript ?? [];
-
-    if (transcriptEntries.length === 0) {
-      const msg = 'No transcript entries recorded. Skipping minutes generation.';
-      console.log(`[MinutesGenerator] ${msg}`);
-
-      if (textChannel) {
-        await textChannel.send({ content: `📝 ${msg}` }).catch(console.error);
-      }
-
-      return {
-        success: true,
-        filePath: null,
-        error: null,
-        generationTimeMs: Date.now() - startTime,
-      };
-    }
-
-    // --- Step 2: Format the meeting minutes ---
-    console.log(`[MinutesGenerator] Formatting minutes for ${transcriptEntries.length} entries...`);
-    const markdown = formatMeetingMinutes(transcriptEntries, metadata);
-
-    // --- Step 3: Save to disk ---
-    await mkdir(MINUTES_DIR, { recursive: true });
-    const filename = generateMinutesFilename(metadata);
-    const filePath = join(MINUTES_DIR, filename);
-
-    await writeFile(filePath, markdown, 'utf-8');
-    console.log(`[MinutesGenerator] Minutes saved: ${filePath}`);
-
-    // --- Step 3b: Update the minutes index ---
-    try {
-      const participantNames = metadata.speakerMap
-        ? [...metadata.speakerMap.values()]
-        : [];
-
-      await addIndexEntry({
-        filename,
-        filePath,
-        startedAt: metadata.startedAt,
-        durationSeconds: metadata.durationSeconds,
-        guildId: session.guildId ?? '',
-        guildName: metadata.guildName,
-        channelId: session.voiceChannelId ?? '',
-        channelName: metadata.channelName,
-        participants: participantNames,
-        transcriptCount: transcriptEntries.length,
-        language: metadata.language,
-        startedBy: metadata.startedBy,
-      });
-    } catch (indexErr) {
-      console.warn('[MinutesGenerator] Failed to update minutes index:', indexErr.message);
-      // Non-fatal: minutes file is already saved
-    }
-
-    // --- Step 4: Send to Discord text channel ---
-    if (textChannel) {
-      await sendMinutesToChannel(textChannel, markdown, filename, metadata, transcriptEntries.length);
-    } else {
-      console.warn(`[MinutesGenerator] Text channel ${session.textChannelId} not found, skipping Discord delivery`);
-    }
-
-    const generationTimeMs = Date.now() - startTime;
-    console.log(`[MinutesGenerator] Pipeline complete in ${generationTimeMs}ms`);
-
-    return {
-      success: true,
-      filePath,
-      error: null,
-      generationTimeMs,
-    };
+    const result = await Promise.race([_runPipeline(input, startTime, guild, textChannel), timeoutPromise]);
+    clearTimeout(timeoutHandle);
+    return result;
   } catch (error) {
+    clearTimeout(timeoutHandle);
     const generationTimeMs = Date.now() - startTime;
-    console.error(`[MinutesGenerator] Pipeline failed after ${generationTimeMs}ms:`, error);
+    const isTimeout = error.message.includes('timed out');
+    console.error(`[MinutesGenerator] Pipeline ${isTimeout ? 'timed out' : 'failed'} after ${generationTimeMs}ms:`, error);
 
-    // Notify the text channel about the failure
     if (textChannel) {
-      await textChannel.send({
-        content: [
-          '❌ **Meeting minutes generation failed**',
-          `Error: ${error.message}`,
-          'The raw transcript has been saved to disk. You can regenerate minutes later.',
-        ].join('\n'),
-      }).catch(console.error);
+      const content = isTimeout
+        ? '⏱️ **Meeting minutes generation timed out**\nThe process took too long and was aborted. The raw transcript has been saved to disk.'
+        : [
+            '❌ **Meeting minutes generation failed**',
+            `Error: ${error.message}`,
+            'The raw transcript has been saved to disk. You can regenerate minutes later.',
+          ].join('\n');
+      await textChannel.send({ content }).catch(console.error);
     }
 
     return {
@@ -156,6 +97,86 @@ export async function generateAndDeliverMinutes(input) {
       generationTimeMs,
     };
   }
+}
+
+async function _runPipeline(input, startTime, guild, textChannel) {
+  const { transcript, session, transcriptResult, duration } = input;
+
+  // --- Step 1: Build metadata for the formatter ---
+  const metadata = buildMetadata(session, transcriptResult, guild, duration);
+
+  // Use transcript from coordinator result if available, otherwise session transcript
+  const transcriptEntries = transcriptResult?.transcript ?? transcript ?? session.transcript ?? [];
+
+  if (transcriptEntries.length === 0) {
+    const msg = 'No transcript entries recorded. Skipping minutes generation.';
+    console.log(`[MinutesGenerator] ${msg}`);
+
+    if (textChannel) {
+      await textChannel.send({ content: `📝 ${msg}` }).catch(console.error);
+    }
+
+    return {
+      success: true,
+      filePath: null,
+      error: null,
+      generationTimeMs: Date.now() - startTime,
+    };
+  }
+
+  // --- Step 2: Format the meeting minutes ---
+  console.log(`[MinutesGenerator] Formatting minutes for ${transcriptEntries.length} entries...`);
+  const markdown = formatMeetingMinutes(transcriptEntries, metadata);
+
+  // --- Step 3: Save to disk ---
+  await mkdir(MINUTES_DIR, { recursive: true });
+  const filename = generateMinutesFilename(metadata);
+  const filePath = join(MINUTES_DIR, filename);
+
+  await writeFile(filePath, markdown, 'utf-8');
+  console.log(`[MinutesGenerator] Minutes saved: ${filePath}`);
+
+  // --- Step 3b: Update the minutes index ---
+  try {
+    const participantNames = metadata.speakerMap
+      ? [...metadata.speakerMap.values()]
+      : [];
+
+    await addIndexEntry({
+      filename,
+      filePath,
+      startedAt: metadata.startedAt,
+      durationSeconds: metadata.durationSeconds,
+      guildId: session.guildId ?? '',
+      guildName: metadata.guildName,
+      channelId: session.voiceChannelId ?? '',
+      channelName: metadata.channelName,
+      participants: participantNames,
+      transcriptCount: transcriptEntries.length,
+      language: metadata.language,
+      startedBy: metadata.startedBy,
+    });
+  } catch (indexErr) {
+    console.warn('[MinutesGenerator] Failed to update minutes index:', indexErr.message);
+    // Non-fatal: minutes file is already saved
+  }
+
+  // --- Step 4: Send to Discord text channel ---
+  if (textChannel) {
+    await sendMinutesToChannel(textChannel, markdown, filename, metadata, transcriptEntries.length);
+  } else {
+    console.warn(`[MinutesGenerator] Text channel ${session.textChannelId} not found, skipping Discord delivery`);
+  }
+
+  const generationTimeMs = Date.now() - startTime;
+  console.log(`[MinutesGenerator] Pipeline complete in ${generationTimeMs}ms`);
+
+  return {
+    success: true,
+    filePath,
+    error: null,
+    generationTimeMs,
+  };
 }
 
 /**

@@ -288,9 +288,10 @@ describe('Standalone Operation — No Openclaw Required', () => {
   });
 
   describe('Graceful degradation without Openclaw', () => {
-    it('MCP server can be created with null deps', () => {
+    it('MCP server can be created with null deps', async () => {
       // Already tested in mcp-server.test.js, but important for standalone guarantee
-      const { createMcpServer } = require_or_import('../src/mcp/server.js');
+      const mod = await import('../src/mcp/server.js');
+      assert.ok(typeof mod.createMcpServer === 'function', 'createMcpServer should be exported');
     });
 
     it('all slash commands work without MCP server running', async () => {
@@ -314,11 +315,3 @@ describe('Standalone Operation — No Openclaw Required', () => {
   });
 });
 
-// Helper for optional dynamic import
-function require_or_import(path) {
-  try {
-    return import(path);
-  } catch {
-    return null;
-  }
-}
