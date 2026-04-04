@@ -1,0 +1,33 @@
+{
+  "name": "dicoclerk",
+  "version": "1.0.0",
+  "description": "Discord voice channel meeting clerk - real-time STT with speaker diarization and meeting minutes generation",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js",
+    "deploy-commands": "node src/deploy-commands.js",
+    "test": "node --test tests/*.test.js",
+    "mcp": "node src/mcp-server.js"
+  },
+  "keywords": [
+    "discord",
+    "stt",
+    "deepgram",
+    "meeting-minutes",
+    "mcp"
+  ],
+  "author": "",
+  "license": "MIT",
+  "type": "module",
+  "dependencies": {
+    "@deepgram/sdk": "^3.9.0",
+    "@discordjs/voice": "^0.18.0",
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "discord.js": "^14.16.0",
+    "dotenv": "^16.4.0",
+    "opusscript": "^0.1.1",
+    "tweetnacl": "^1.0.3",
+    "zod": "^4.3.6"
+  }
+}
