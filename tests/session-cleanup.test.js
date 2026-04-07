@@ -125,6 +125,129 @@ describe('cleanupSession', () => {
   });
 });
 
+describe('cleanupSession — direct mode (session provided, auto-disconnect path)', () => {
+  it('should use provided session without calling getSession()', async () => {
+    const coordinatorStopMock = mock.fn(async () => ({
+      transcript: [{ speaker: 0, text: 'Auto hello', confidence: 0.9, start: 0, end: 1 }],
+      filePath: '/data/transcripts/auto.json',
+    }));
+
+    const session = createMockSession({
+      audioCoordinator: { isRunning: true, stop: coordinatorStopMock },
+    });
+
+    // sessionManager.getSession() should NOT be called in direct mode
+    const sm = createMockSessionManager(null); // returns null if called
+
+    const result = await cleanupSession({
+      sessionManager: sm,
+      guildId: 'guild-123',
+      reason: 'channel_empty',
+      session, // <-- direct mode
+    });
+
+    // getSession was not consulted
+    assert.equal(sm.getSession.mock.callCount(), 0);
+    // coordinator was stopped
+    assert.equal(coordinatorStopMock.mock.callCount(), 1);
+    // stopSession is skipped in direct mode (session already removed from map)
+    assert.equal(sm.stopSession.mock.callCount(), 0);
+    assert.equal(result.reason, 'channel_empty');
+    assert.equal(result.transcriptCount, 1);
+    assert.equal(result.transcriptFilePath, '/data/transcripts/auto.json');
+    assert.equal(result.success, true);
+  });
+
+  it('should handle coordinator failure in direct mode', async () => {
+    const session = createMockSession({
+      audioCoordinator: {
+        isRunning: true,
+        stop: mock.fn(async () => { throw new Error('stream closed'); }),
+        transcript: [{ text: 'fallback entry' }],
+      },
+    });
+
+    const sm = createMockSessionManager(null);
+
+    const result = await cleanupSession({
+      sessionManager: sm,
+      guildId: 'guild-123',
+      reason: 'connection_destroyed',
+      session,
+    });
+
+    assert.equal(sm.getSession.mock.callCount(), 0);
+    assert.equal(sm.stopSession.mock.callCount(), 0);
+    assert.ok(result.warnings.some(w => w.includes('stream closed')));
+    // Falls back to coordinator.transcript
+    assert.equal(result.transcriptCount, 1);
+    assert.equal(result.reason, 'connection_destroyed');
+  });
+
+  it('should work correctly for channel_empty with no coordinator', async () => {
+    const session = createMockSession({ audioCoordinator: null });
+    const sm = createMockSessionManager(null);
+
+    const result = await cleanupSession({
+      sessionManager: sm,
+      guildId: 'guild-123',
+      reason: 'channel_empty',
+      session,
+    });
+
+    assert.equal(sm.getSession.mock.callCount(), 0);
+    assert.equal(sm.stopSession.mock.callCount(), 0);
+    assert.ok(result.warnings.some(w => w.includes('No audio coordinator')));
+    assert.equal(result.transcriptCount, 1); // from session.transcript
+    assert.equal(result.success, true);
+  });
+
+  it('should not call stopSession in direct mode even if coordinator stops cleanly', async () => {
+    const session = createMockSession({
+      audioCoordinator: {
+        isRunning: true,
+        stop: mock.fn(async () => ({ transcript: [], filePath: null })),
+      },
+    });
+    const sm = createMockSessionManager(null);
+
+    await cleanupSession({
+      sessionManager: sm,
+      guildId: 'guild-123',
+      reason: 'channel_empty',
+      session,
+    });
+
+    assert.equal(sm.stopSession.mock.callCount(), 0);
+  });
+});
+
+describe('cleanupSession — lookup mode vs direct mode comparison', () => {
+  it('lookup mode calls getSession() and stopSession(); direct mode calls neither', async () => {
+    const session = createMockSession({
+      audioCoordinator: {
+        isRunning: true,
+        stop: mock.fn(async () => ({ transcript: [], filePath: null })),
+      },
+    });
+
+    // Lookup mode
+    const smLookup = createMockSessionManager(session);
+    await cleanupSession({ sessionManager: smLookup, guildId: 'guild-123', reason: 'manual_stop' });
+    assert.equal(smLookup.getSession.mock.callCount(), 1);
+    assert.equal(smLookup.stopSession.mock.callCount(), 1);
+
+    // Reset coordinator mock call count for second run
+    session.audioCoordinator.stop = mock.fn(async () => ({ transcript: [], filePath: null }));
+
+    // Direct mode
+    const smDirect = createMockSessionManager(null);
+    await cleanupSession({ sessionManager: smDirect, guildId: 'guild-123', reason: 'channel_empty', session });
+    assert.equal(smDirect.getSession.mock.callCount(), 0);
+    assert.equal(smDirect.stopSession.mock.callCount(), 0);
+  });
+});
+
 describe('formatCleanupMessage', () => {
   it('should format manual_stop message', () => {
     const msg = formatCleanupMessage({
@@ -204,5 +327,128 @@ describe('formatCleanupMessage', () => {
 
     // Implementation maps 'shutdown' to 'Recording stopped (bot shutting down)'
     assert.ok(msg.includes('shutting down') || msg.includes('Recording stopped'));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// cleanupSession — speakerMap capture
+// ---------------------------------------------------------------------------
+
+describe('cleanupSession — speakerMap capture from coordinator', () => {
+  it('should capture speakerMap from coordinator.speakerMap getter after stop()', async () => {
+    const resolvedSpeakerMap = new Map([[0, 'Alice'], [1, 'Bob']]);
+
+    const session = createMockSession({
+      audioCoordinator: {
+        isRunning: true,
+        stop: mock.fn(async () => ({
+          transcript: [
+            { speaker: 0, text: 'Hello', confidence: 0.95, start: 0, end: 1 },
+            { speaker: 1, text: 'World', confidence: 0.9, start: 2, end: 3 },
+          ],
+          filePath: '/data/transcripts/test.json',
+        })),
+        // speakerMap getter — reflects post-stop() resolution
+        speakerMap: resolvedSpeakerMap,
+      },
+    });
+    const sm = createMockSessionManager(session);
+
+    const result = await cleanupSession({ sessionManager: sm, guildId: 'guild-123', reason: 'manual_stop' });
+
+    assert.ok(result.speakerMap instanceof Map, 'speakerMap should be a Map');
+    assert.equal(result.speakerMap.get(0), 'Alice');
+    assert.equal(result.speakerMap.get(1), 'Bob');
+  });
+
+  it('should return null speakerMap when coordinator has empty map', async () => {
+    const session = createMockSession({
+      audioCoordinator: {
+        isRunning: true,
+        stop: mock.fn(async () => ({ transcript: [], filePath: null })),
+        speakerMap: new Map(), // empty — should NOT be propagated
+      },
+    });
+    const sm = createMockSessionManager(session);
+
+    const result = await cleanupSession({ sessionManager: sm, guildId: 'guild-123', reason: 'manual_stop' });
+
+    assert.equal(result.speakerMap, null, 'Empty speakerMap should not be propagated');
+  });
+
+  it('should return null speakerMap when coordinator has no speakerMap property', async () => {
+    const session = createMockSession({
+      audioCoordinator: {
+        isRunning: true,
+        stop: mock.fn(async () => ({ transcript: [], filePath: null })),
+        // No speakerMap property
+      },
+    });
+    const sm = createMockSessionManager(session);
+
+    const result = await cleanupSession({ sessionManager: sm, guildId: 'guild-123', reason: 'manual_stop' });
+
+    assert.equal(result.speakerMap, null);
+  });
+
+  it('should return null speakerMap when no audio coordinator attached', async () => {
+    const session = createMockSession({ audioCoordinator: null });
+    const sm = createMockSessionManager(session);
+
+    const result = await cleanupSession({ sessionManager: sm, guildId: 'guild-123', reason: 'manual_stop' });
+
+    assert.equal(result.speakerMap, null);
+  });
+
+  it('should still capture speakerMap even when coordinator.stop() throws', async () => {
+    const resolvedSpeakerMap = new Map([[0, 'Carol']]);
+
+    const session = createMockSession({
+      transcript: [{ speaker: 0, text: 'Partial.', isFinal: true }],
+      audioCoordinator: {
+        isRunning: true,
+        stop: mock.fn(async () => { throw new Error('stream closed unexpectedly'); }),
+        // speakerMap is still accessible after a stop() failure
+        speakerMap: resolvedSpeakerMap,
+        transcript: [],
+      },
+    });
+    const sm = createMockSessionManager(session);
+
+    const result = await cleanupSession({ sessionManager: sm, guildId: 'guild-123', reason: 'channel_empty' });
+
+    assert.ok(result.speakerMap instanceof Map, 'speakerMap should be captured even after stop() failure');
+    assert.equal(result.speakerMap.get(0), 'Carol');
+    assert.ok(result.warnings.some(w => w.includes('stream closed')));
+  });
+
+  it('should capture speakerMap in direct mode (auto-disconnect path)', async () => {
+    const resolvedSpeakerMap = new Map([[0, 'Dave'], [1, 'Eve']]);
+
+    const session = createMockSession({
+      audioCoordinator: {
+        isRunning: true,
+        stop: mock.fn(async () => ({
+          transcript: [{ speaker: 0, text: 'Auto-stop.', confidence: 0.9, start: 0, end: 1 }],
+          filePath: '/data/auto.json',
+        })),
+        speakerMap: resolvedSpeakerMap,
+      },
+    });
+
+    // Direct mode: session is provided, sessionManager.getSession not consulted
+    const sm = createMockSessionManager(null);
+
+    const result = await cleanupSession({
+      sessionManager: sm,
+      guildId: 'guild-123',
+      reason: 'channel_empty',
+      session, // direct mode
+    });
+
+    assert.ok(result.speakerMap instanceof Map);
+    assert.equal(result.speakerMap.get(0), 'Dave');
+    assert.equal(result.speakerMap.get(1), 'Eve');
+    assert.equal(sm.getSession.mock.callCount(), 0);
   });
 });

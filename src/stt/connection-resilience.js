@@ -52,6 +52,10 @@ const ConnectionState = {
  * - 'buffer_overflow'       : { dropped, buffered } — buffer is full, packets dropped
  * - 'buffer_replayed'       : { count } — buffered packets replayed after reconnect
  * - 'fallback_save_needed'  : void — permanent failure, caller should save transcript
+ * - 'drop_context'          : { sessionId, sessionStartTime, lastStreamTimestamp,
+ *                               reconnectAttempts, bufferedPackets, droppedPackets,
+ *                               detectedAt } — context snapshot on each unexpected drop;
+ *                               consumers can use this to preserve transcript state
  */
 export class DeepgramConnectionResilience extends EventEmitter {
   /** @type {import('./deepgram-client.js').DeepgramStreamingClient} */
@@ -80,6 +84,15 @@ export class DeepgramConnectionResilience extends EventEmitter {
 
   /** @type {number} session start timestamp */
   #sessionStartedAt = 0;
+
+  /**
+   * Context snapshot from the most recent unexpected drop.
+   * Includes Deepgram stream state (sessionStartTime, lastStreamTimestamp) plus
+   * resilience state (buffered/dropped packets) so consumers can resume accurately.
+   * Cleared on successful reconnection.
+   * @type {Object|null}
+   */
+  #lastDropContext = null;
 
   /**
    * @param {import('./deepgram-client.js').DeepgramStreamingClient} deepgramClient
@@ -136,6 +149,19 @@ export class DeepgramConnectionResilience extends EventEmitter {
   /** Total packets dropped due to buffer overflow */
   get droppedPackets() {
     return this.#droppedPackets;
+  }
+
+  /**
+   * Context snapshot from the most recent unexpected connection drop, or null
+   * if no drop has occurred yet (or after a successful reconnection clears it).
+   *
+   * Shape: { sessionId, sessionStartTime, lastStreamTimestamp, reconnectAttempts,
+   *          bufferedPackets, droppedPackets, detectedAt }
+   *
+   * @returns {Object|null}
+   */
+  get lastDropContext() {
+    return this.#lastDropContext ? { ...this.#lastDropContext } : null;
   }
 
   /**
@@ -211,6 +237,7 @@ export class DeepgramConnectionResilience extends EventEmitter {
       droppedPackets: this.#droppedPackets,
       reconnectSuccessCount: this.#reconnectSuccessCount,
       reconnectInfo: this.#reconnectInfo ? { ...this.#reconnectInfo } : null,
+      lastDropContext: this.#lastDropContext ? { ...this.#lastDropContext } : null,
       uptimeMs: Date.now() - this.#sessionStartedAt,
     };
   }
@@ -222,6 +249,7 @@ export class DeepgramConnectionResilience extends EventEmitter {
     this.#audioBuffer = [];
     this.#droppedPackets = 0;
     this.#reconnectInfo = null;
+    this.#lastDropContext = null;
     this.removeAllListeners();
   }
 
@@ -237,6 +265,7 @@ export class DeepgramConnectionResilience extends EventEmitter {
     this.#client.on('disconnected', (info) => this.#handleDisconnected(info));
     this.#client.on('reconnecting', (info) => this.#handleReconnecting(info));
     this.#client.on('error', (err) => this.#handleError(err));
+    this.#client.on('drop_detected', (ctx) => this.#handleDropDetected(ctx));
   }
 
   // ──────────────────────────────────────────────
@@ -269,11 +298,51 @@ export class DeepgramConnectionResilience extends EventEmitter {
       this.replayBuffer();
 
       this.#reconnectInfo = null;
+      // Clear drop context — connection is healthy again
+      this.#lastDropContext = null;
 
     } else if (previous === ConnectionState.DISCONNECTED) {
       // Initial connection
       console.log('[ConnectionResilience] Initial Deepgram connection established');
     }
+  }
+
+  /**
+   * Handle the 'drop_detected' event from DeepgramStreamingClient.
+   *
+   * Builds a merged context snapshot combining the Deepgram stream context
+   * (sessionStartTime, lastStreamTimestamp) with local resilience state
+   * (bufferedPackets, droppedPackets) and emits it as 'drop_context' so that
+   * the session coordinator and other consumers can preserve transcript state.
+   *
+   * @param {Object} ctx - Drop context from DeepgramStreamingClient.getDropContext()
+   *   plus { code, reason }
+   */
+  #handleDropDetected(ctx) {
+    const snapshot = {
+      // Deepgram stream context
+      sessionId: ctx.sessionId ?? null,
+      sessionStartTime: ctx.sessionStartTime ?? null,
+      lastStreamTimestamp: ctx.lastStreamTimestamp ?? 0,
+      reconnectAttempts: ctx.reconnectAttempts ?? 0,
+      // Resilience state at time of drop
+      bufferedPackets: this.#audioBuffer.length,
+      droppedPackets: this.#droppedPackets,
+      detectedAt: Date.now(),
+      // WebSocket close info
+      closeCode: ctx.code ?? null,
+      closeReason: ctx.reason ?? 'unknown',
+    };
+
+    this.#lastDropContext = snapshot;
+
+    console.log(
+      `[ConnectionResilience] Drop detected: sessionId=${snapshot.sessionId} ` +
+      `lastStreamTimestamp=${snapshot.lastStreamTimestamp}s ` +
+      `buffered=${snapshot.bufferedPackets} dropped=${snapshot.droppedPackets}`
+    );
+
+    this.emit('drop_context', snapshot);
   }
 
   /**

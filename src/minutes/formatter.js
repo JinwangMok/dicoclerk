@@ -809,7 +809,7 @@ function formatTranscript(transcript, speakerMap, options) {
  * @param {Partial<MinutesOptions>} [opts] - Formatting options
  * @returns {string} - Complete Markdown meeting minutes
  */
-export function formatMeetingMinutes(transcript, metadata, opts = {}) {
+export function formatMeetingMinutes(transcript, metadata, opts = {}, aiContent = null) {
   const options = { ...DEFAULT_OPTIONS, ...opts };
 
   const {
@@ -822,12 +822,18 @@ export function formatMeetingMinutes(transcript, metadata, opts = {}) {
     speakerMap = new Map(),
   } = metadata;
 
-  // --- Extract structured data ---
+  // --- Extract structured data (heuristic) ---
   const attendees = extractAttendees(transcript, speakerMap);
   const actionItems = extractActionItems(transcript, speakerMap, language, options.maxActionItems);
   const decisions = extractDecisions(transcript, speakerMap, language, options.maxActionItems);
   const keyPoints = extractKeyPoints(transcript, speakerMap, language, options.maxSummaryPoints);
   const summary = generateSummary(transcript, attendees, durationSeconds, language, speakerMap);
+
+  // --- Apply AI-generated overrides when available ---
+  // aiContent is produced by llm-processor.js; null fields fall back to heuristic output.
+  const finalSummary     = aiContent?.summary     ?? summary;
+  const aiDecisions      = aiContent?.decisions   ?? null;   // null → use heuristic
+  const aiActionItems    = aiContent?.actionItems ?? null;   // null → use heuristic
 
   // --- Build Markdown ---
   const title = options.title || (language === 'en' ? 'Meeting Minutes' : '회의록');
@@ -849,7 +855,7 @@ export function formatMeetingMinutes(transcript, metadata, opts = {}) {
   sections.push(`| **${language === 'en' ? 'Started by' : '시작'}** | ${startedBy} |`);
   sections.push('');
 
-  // === Attendees ===
+  // === Attendees / Participants ===
   const attendeesHeader = language === 'en' ? 'Attendees' : '참석자';
   sections.push(`## ${attendeesHeader}`);
   sections.push('');
@@ -864,11 +870,30 @@ export function formatMeetingMinutes(transcript, metadata, opts = {}) {
   }
   sections.push('');
 
+  // === Full Transcript ===
+  // Template order: date/participants → full transcript → summary → decisions → action items
+  if (options.includeTranscript) {
+    const transcriptHeader = language === 'en' ? 'Full Transcript' : '전체 녹취록';
+    sections.push(`## ${transcriptHeader}`);
+    sections.push('');
+    sections.push('<details>');
+    sections.push(`<summary>${language === 'en' ? 'Click to expand' : '펼치기'}</summary>`);
+    sections.push('');
+    sections.push(formatTranscript(transcript, speakerMap, options));
+    sections.push('');
+    sections.push('</details>');
+    sections.push('');
+  }
+
   // === Summary ===
   const summaryHeader = language === 'en' ? 'Summary' : '요약';
   sections.push(`## ${summaryHeader}`);
   sections.push('');
-  sections.push(summary);
+  if (aiContent?.summary) {
+    sections.push('> 🤖 _AI-generated summary_');
+    sections.push('');
+  }
+  sections.push(finalSummary);
   sections.push('');
 
   // === Key Discussion Points ===
@@ -894,12 +919,24 @@ export function formatMeetingMinutes(transcript, metadata, opts = {}) {
   const decisionsHeader = language === 'en' ? 'Decisions' : '결정 사항';
   sections.push(`## ${decisionsHeader}`);
   sections.push('');
-  if (decisions.length === 0) {
-    sections.push(language === 'en' ? '_No decisions identified._' : '_결정 사항이 식별되지 않았습니다._');
+  if (aiDecisions !== null) {
+    // AI-generated decisions (plain strings, no timestamps)
+    if (aiDecisions.length === 0) {
+      sections.push(language === 'en' ? '_No decisions identified._' : '_결정 사항이 식별되지 않았습니다._');
+    } else {
+      for (const decision of aiDecisions) {
+        sections.push(`- ✅ ${decision}`);
+      }
+    }
   } else {
-    for (const decision of decisions) {
-      const ts = formatTimestamp(decision.timestamp);
-      sections.push(`- ✅ ${decision.text} — _${decision.speaker}_ ${ts}`);
+    // Heuristic decisions (include speaker attribution and timestamp)
+    if (decisions.length === 0) {
+      sections.push(language === 'en' ? '_No decisions identified._' : '_결정 사항이 식별되지 않았습니다._');
+    } else {
+      for (const decision of decisions) {
+        const ts = formatTimestamp(decision.timestamp);
+        sections.push(`- ✅ ${decision.text} — _${decision.speaker}_ ${ts}`);
+      }
     }
   }
   sections.push('');
@@ -908,39 +945,44 @@ export function formatMeetingMinutes(transcript, metadata, opts = {}) {
   const actionHeader = language === 'en' ? 'Action Items' : '액션 아이템';
   sections.push(`## ${actionHeader}`);
   sections.push('');
-  if (actionItems.length === 0) {
-    sections.push(language === 'en' ? '_No action items identified._' : '_액션 아이템이 식별되지 않았습니다._');
-  } else {
-    for (const item of actionItems) {
-      const ts = formatTimestamp(item.timestamp);
-      const assigneeLabel = language === 'en' ? 'Assignee' : '담당';
-      const deadlineLabel = language === 'en' ? 'Deadline' : '기한';
-
-      let line = `- [ ] ${item.text} — _${item.speaker}_ ${ts}`;
-      const meta = [];
-      if (item.assignee) meta.push(`**${assigneeLabel}:** ${item.assignee}`);
-      if (item.deadline) meta.push(`**${deadlineLabel}:** ${item.deadline}`);
-      if (meta.length > 0) {
-        line += `\n  - ${meta.join(' | ')}`;
+  const assigneeLabel = language === 'en' ? 'Assignee' : '담당';
+  const deadlineLabel = language === 'en' ? 'Deadline' : '기한';
+  if (aiActionItems !== null) {
+    // AI-generated action items (task / assignee / deadline, no timestamps)
+    if (aiActionItems.length === 0) {
+      sections.push(language === 'en' ? '_No action items identified._' : '_액션 아이템이 식별되지 않았습니다._');
+    } else {
+      for (const item of aiActionItems) {
+        let line = `- [ ] ${item.task}`;
+        const meta = [];
+        if (item.assignee) meta.push(`**${assigneeLabel}:** ${item.assignee}`);
+        if (item.deadline) meta.push(`**${deadlineLabel}:** ${item.deadline}`);
+        if (meta.length > 0) {
+          line += `\n  - ${meta.join(' | ')}`;
+        }
+        sections.push(line);
       }
-      sections.push(line);
+    }
+  } else {
+    // Heuristic action items (include speaker attribution and timestamp)
+    if (actionItems.length === 0) {
+      sections.push(language === 'en' ? '_No action items identified._' : '_액션 아이템이 식별되지 않았습니다._');
+    } else {
+      for (const item of actionItems) {
+        const ts = formatTimestamp(item.timestamp);
+
+        let line = `- [ ] ${item.text} — _${item.speaker}_ ${ts}`;
+        const meta = [];
+        if (item.assignee) meta.push(`**${assigneeLabel}:** ${item.assignee}`);
+        if (item.deadline) meta.push(`**${deadlineLabel}:** ${item.deadline}`);
+        if (meta.length > 0) {
+          line += `\n  - ${meta.join(' | ')}`;
+        }
+        sections.push(line);
+      }
     }
   }
   sections.push('');
-
-  // === Full Transcript ===
-  if (options.includeTranscript) {
-    const transcriptHeader = language === 'en' ? 'Full Transcript' : '전체 녹취록';
-    sections.push(`## ${transcriptHeader}`);
-    sections.push('');
-    sections.push('<details>');
-    sections.push(`<summary>${language === 'en' ? 'Click to expand' : '펼치기'}</summary>`);
-    sections.push('');
-    sections.push(formatTranscript(transcript, speakerMap, options));
-    sections.push('');
-    sections.push('</details>');
-    sections.push('');
-  }
 
   // === Footer ===
   sections.push('---');
@@ -965,6 +1007,65 @@ export function generateMinutesFilename(metadata) {
     .replace(/[^a-zA-Z0-9가-힣_-]/g, '_')
     .slice(0, 30);
   return `minutes_${date}_${time}_${channel}.md`;
+}
+
+/**
+ * Render meeting minutes directly from a structured SessionMinutesData object.
+ *
+ * This is the primary entry point when the caller has the aggregated session
+ * data object (produced by aggregator.js). It extracts the transcript and
+ * builds the SessionMetadata shape internally, then delegates to
+ * formatMeetingMinutes for template rendering.
+ *
+ * Required SessionMinutesData fields:
+ *   - transcript        {TranscriptEntry[]}        Full chronological transcript
+ *   - guildName         {string}                   Discord server name
+ *   - channelName       {string}                   Voice channel name
+ *   - startedAt         {Date}                     Session start timestamp
+ *   - durationSeconds   {number}                   Total session duration
+ *   - startedBy         {string}                   User who started the session
+ *   - language          {string}                   Language code ('ko' | 'en')
+ *   - speakerMap        {Map<number, string>}       Speaker label → display name
+ *
+ * @param {import('../minutes/aggregator.js').SessionMinutesData} sessionData
+ * @param {Partial<MinutesOptions>} [opts] - Optional formatting overrides
+ * @returns {string} Rendered Markdown meeting minutes
+ */
+export function renderMinutesFromSession(sessionData, opts = {}) {
+  if (!sessionData || typeof sessionData !== 'object') {
+    throw new TypeError('[Formatter] renderMinutesFromSession: sessionData must be a non-null object');
+  }
+
+  const {
+    transcript = [],
+    guildName = 'Unknown Server',
+    channelName = 'Unknown Channel',
+    startedAt = new Date(),
+    durationSeconds = 0,
+    startedBy = 'Unknown',
+    language = 'ko',
+    speakerMap = new Map(),
+  } = sessionData;
+
+  /** @type {SessionMetadata} */
+  const metadata = {
+    guildName,
+    channelName,
+    startedAt: startedAt instanceof Date ? startedAt : new Date(startedAt),
+    durationSeconds,
+    startedBy,
+    language,
+    speakerMap: speakerMap instanceof Map
+      ? speakerMap
+      : new Map(
+          Object.entries(speakerMap).map(([k, v]) => {
+            const num = Number(k);
+            return [isNaN(num) ? k : num, v];
+          })
+        ),
+  };
+
+  return formatMeetingMinutes(transcript, metadata, opts);
 }
 
 export {

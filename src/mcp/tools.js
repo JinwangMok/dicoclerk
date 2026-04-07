@@ -4,6 +4,9 @@
  * Registers all MCP tools that expose dicoclerk functionality
  * to external agents (e.g., Openclaw).
  *
+ * All input shapes are imported from ./schemas.js — the single source
+ * of truth for both tool registration and programmatic validation.
+ *
  * Tools:
  *   Session Management:
  *   - start_session: Start a new recording session in a voice channel
@@ -22,19 +25,41 @@
  *
  *   Storage Queries:
  *   - list_recordings: List all stored recordings/transcripts
+ *
+ *   System:
+ *   - get_status: Get system-wide bot status and active session health
  */
-import { z } from 'zod';
 import {
+  JOIN_VOICE_CHANNEL_SHAPE,
+  LEAVE_VOICE_CHANNEL_SHAPE,
+  START_SESSION_SHAPE,
+  STOP_SESSION_SHAPE,
+  LIST_SESSIONS_SHAPE,
+  GET_SESSION_SHAPE,
+  GET_STATUS_SHAPE,
+  GET_TRANSCRIPT_SHAPE,
+  GET_MINUTES_SHAPE,
+  LIST_RECORDINGS_SHAPE,
+  SEARCH_MINUTES_SHAPE,
+  SEARCH_MEETING_MINUTES_SHAPE,
+  SUMMARIZE_MINUTES_SHAPE,
+  GET_MEETING_MINUTES_SHAPE,
+} from './schemas.js';
+import {
+  joinVoiceChannel,
+  leaveVoiceChannel,
   startSession,
   stopSession,
   listSessions,
   getSession,
+  getStatus,
   getTranscript,
   getMinutes,
   listRecordings,
   searchMinutes,
   searchMeetingMinutes,
   summarizeMinutes,
+  getPreviousMinutes,
 } from './handlers.js';
 
 /**
@@ -44,17 +69,28 @@ import {
  * @param {object} deps - App dependencies
  */
 export function registerTools(server, deps) {
+  // --- Voice Channel Tools ---
+
+  server.tool(
+    'join_voice_channel',
+    'Join a Discord voice channel and return connection status. Use this as a lightweight connectivity probe to verify the bot can reach a specific channel before starting a recording session. Returns the channel name, human member count, and a connection_state of "connected", "already_connected" (bot is already in that channel via an active session), "session_active" (bot is in a different channel), or "failed". Does NOT start STT or Deepgram processing.',
+    JOIN_VOICE_CHANNEL_SHAPE,
+    async ({ guild_id, channel_id }) => joinVoiceChannel(deps, guild_id, channel_id)
+  );
+
+  server.tool(
+    'leave_voice_channel',
+    'Disconnect the bot from the voice channel for a guild. If a recording session is active, it is stopped gracefully: the Deepgram STT stream is flushed, the transcript is saved to disk, and meeting minutes generation is triggered (delivered to the text channel within 1-2 minutes). Returns a session summary with duration, participant count, transcript count, and minutes generation status. Use this to cleanly end a session initiated by start_session or triggered via /start. Requires the Discord bot to be running.',
+    LEAVE_VOICE_CHANNEL_SHAPE,
+    async ({ guild_id }) => leaveVoiceChannel(deps, guild_id)
+  );
+
   // --- Session Management Tools ---
 
   server.tool(
     'start_session',
     'Start a new voice recording session in a Discord voice channel. Joins the channel, begins STT via Deepgram with speaker diarization, and records a full transcript. Requires the bot to be running (not available in standalone MCP mode).',
-    {
-      guild_id: z.string().describe('Discord guild (server) ID'),
-      voice_channel_id: z.string().describe('Voice channel ID to join and record'),
-      text_channel_id: z.string().describe('Text channel ID for status messages and minutes delivery'),
-      language: z.enum(['ko', 'en', 'multi']).default('multi').describe('Language for STT: ko (Korean), en (English), or multi (auto-detect Korean+English)'),
-    },
+    START_SESSION_SHAPE,
     async ({ guild_id, voice_channel_id, text_channel_id, language }) =>
       startSession(deps, guild_id, voice_channel_id, text_channel_id, language)
   );
@@ -62,91 +98,68 @@ export function registerTools(server, deps) {
   server.tool(
     'stop_session',
     'Stop an active recording session. Disconnects from voice, finalizes the transcript, and triggers meeting minutes generation. Minutes are delivered to the text channel as a markdown file within 1-2 minutes.',
-    {
-      guild_id: z.string().describe('Discord guild (server) ID with an active session'),
-    },
+    STOP_SESSION_SHAPE,
     async ({ guild_id }) => stopSession(deps, guild_id)
   );
 
   server.tool(
     'list_sessions',
     'List all active voice recording sessions across guilds',
-    {},
+    LIST_SESSIONS_SHAPE,
     async () => listSessions(deps)
   );
 
   server.tool(
     'get_session',
     'Get detailed information about a specific recording session',
-    {
-      guild_id: z.string().describe('Discord guild (server) ID'),
-    },
+    GET_SESSION_SHAPE,
     async ({ guild_id }) => getSession(deps, guild_id)
   );
 
   server.tool(
+    'get_status',
+    'Get the current system status of the dicoclerk bot. Returns bot mode (connected/standalone), all active recording sessions with their live stats (participants, transcript count, recording state, Deepgram connection health), and system info (version, uptime, Deepgram configuration). Use this to check if any sessions are active before issuing start_session or stop_session commands.',
+    GET_STATUS_SHAPE,
+    async ({ guild_id } = {}) => getStatus(deps, guild_id)
+  );
+
+  server.tool(
     'get_transcript',
-    'Get the live or completed transcript for a recording session',
-    {
-      guild_id: z.string().describe('Discord guild (server) ID'),
-      format: z.enum(['raw', 'formatted']).default('formatted').describe('Transcript output format'),
-    },
-    async ({ guild_id, format }) => getTranscript(deps, guild_id, format)
+    'Retrieve the full transcript for a recording session with speaker diarization. ' +
+    'Supply guild_id to get the current active session, or session_id for a specific stored session ' +
+    '(use "current" as session_id alias for the active session). ' +
+    'format="raw" returns structured JSON with speaker_label, speaker_name, user_id, text, start/end ' +
+    'timestamps, confidence, and language per entry. ' +
+    'format="formatted" (default) returns a human-readable speaker-attributed text transcript.',
+    GET_TRANSCRIPT_SHAPE,
+    async ({ guild_id, session_id, format }) => getTranscript(deps, guild_id, session_id, format)
   );
 
   server.tool(
     'get_minutes',
     'Get generated meeting minutes for a completed session',
-    {
-      guild_id: z.string().describe('Discord guild (server) ID'),
-      session_id: z.string().optional().describe('Specific session ID (defaults to latest)'),
-    },
+    GET_MINUTES_SHAPE,
     async ({ guild_id, session_id }) => getMinutes(deps, guild_id, session_id)
   );
 
   server.tool(
     'list_recordings',
     'List all stored recordings and transcripts on disk',
-    {
-      limit: z.number().default(20).describe('Maximum number of recordings to return'),
-      guild_id: z.string().optional().describe('Filter by guild ID'),
-    },
+    LIST_RECORDINGS_SHAPE,
     async ({ limit, guild_id }) => listRecordings(deps, limit, guild_id)
   );
 
   server.tool(
     'search_minutes',
     'Search meeting minutes by date, channel, participant, or free-text query. Returns metadata index entries.',
-    {
-      query: z.string().optional().describe('Free-text search across channel name, guild, participants'),
-      guild_id: z.string().optional().describe('Filter by Discord guild ID'),
-      channel_name: z.string().optional().describe('Partial match on voice channel name'),
-      participant: z.string().optional().describe('Partial match on participant name'),
-      date_from: z.string().optional().describe('Start date filter (YYYY-MM-DD, inclusive)'),
-      date_to: z.string().optional().describe('End date filter (YYYY-MM-DD, inclusive)'),
-      language: z.string().optional().describe('Filter by language code (ko/en)'),
-      limit: z.number().default(20).describe('Maximum results to return'),
-      offset: z.number().default(0).describe('Skip first N results for pagination'),
-    },
+    SEARCH_MINUTES_SHAPE,
     async (params) => searchMinutes(deps, params)
   );
 
   server.tool(
     'search_meeting_minutes',
     'Search and retrieve previous meeting minutes with full content. Accepts filters (date range, keywords, participants) and returns matching minutes with their complete markdown content. Use this to find and read past meeting records.',
-    {
-      query: z.string().optional().describe('Free-text search across metadata fields and minutes content'),
-      guild_id: z.string().optional().describe('Filter by Discord guild ID'),
-      channel_name: z.string().optional().describe('Partial match on voice channel name'),
-      participant: z.string().optional().describe('Partial match on participant name'),
-      date_from: z.string().optional().describe('Start date filter (YYYY-MM-DD, inclusive)'),
-      date_to: z.string().optional().describe('End date filter (YYYY-MM-DD, inclusive)'),
-      keywords: z.array(z.string()).optional().describe('Keywords to search within minutes content (all matched entries contain at least one keyword)'),
-      language: z.string().optional().describe('Filter by language code (ko/en)'),
-      limit: z.number().default(5).describe('Maximum results to return (default 5, lower due to content size)'),
-      offset: z.number().default(0).describe('Skip first N results for pagination'),
-      include_content: z.boolean().default(true).describe('Whether to include full markdown content in results (default true)'),
-    },
+    SEARCH_MEETING_MINUTES_SHAPE,
     async (params) => searchMeetingMinutes(deps, params)
   );
 
@@ -155,22 +168,16 @@ export function registerTools(server, deps) {
   server.tool(
     'summarize_minutes',
     'Generate condensed contextual summaries from past meeting minutes. Retrieves minutes matching the given filters and returns structured summaries with key topics, action items, decisions, and a narrative overview. Supports an optional focus_query to bias the summary toward a specific topic. Ideal for agents that need a quick digest of one or more past meetings without reading full transcripts.',
-    {
-      query: z.string().optional().describe('Free-text search across metadata fields and minutes content'),
-      guild_id: z.string().optional().describe('Filter by Discord guild ID'),
-      channel_name: z.string().optional().describe('Partial match on voice channel name'),
-      participant: z.string().optional().describe('Partial match on participant name'),
-      date_from: z.string().optional().describe('Start date filter (YYYY-MM-DD, inclusive)'),
-      date_to: z.string().optional().describe('End date filter (YYYY-MM-DD, inclusive)'),
-      keywords: z.array(z.string()).optional().describe('Keywords to search within minutes content'),
-      language: z.string().optional().describe('Filter by language code (ko/en)'),
-      limit: z.number().default(5).describe('Maximum number of meetings to summarize (default 5)'),
-      offset: z.number().default(0).describe('Skip first N results for pagination'),
-      focus_query: z.string().optional().describe('Focus the summary on a specific topic or keyword — relevant content is prioritized and highlighted'),
-      max_topics: z.number().default(5).describe('Maximum key topics per meeting summary'),
-      max_action_items: z.number().default(10).describe('Maximum action items per meeting summary'),
-      max_narrative_length: z.number().default(500).describe('Maximum character length for the narrative summary per meeting'),
-    },
+    SUMMARIZE_MINUTES_SHAPE,
     async (params) => summarizeMinutes(deps, params)
+  );
+
+  // --- Structured Minutes Retrieval Tool ---
+
+  server.tool(
+    'get_meeting_minutes',
+    'Retrieve stored meeting minutes as fully structured JSON data. Accepts optional filters for session ID, date range (date_from/date_to in YYYY-MM-DD format), channel name, participant, guild, keywords, and language. Returns each matching minutes file parsed into structured fields: summary, key_discussion_points, action_items (with task/assignee/deadline), decisions, attendees, and statistics. Optionally includes raw_markdown or full transcript entries. Results are ordered newest-first and support limit/offset pagination. Use this to programmatically access and analyse past meeting records without reading raw markdown.',
+    GET_MEETING_MINUTES_SHAPE,
+    async (params) => getPreviousMinutes(deps, params)
   );
 }

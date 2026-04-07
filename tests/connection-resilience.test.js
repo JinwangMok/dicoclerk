@@ -450,4 +450,119 @@ describe('DeepgramConnectionResilience', () => {
       assert.equal(ConnectionState.DISCONNECTED, 'disconnected');
     });
   });
+
+  // ── Drop detection & context preservation (Sub-AC 12a) ──────────────────
+
+  describe('drop_detected integration (Sub-AC 12a)', () => {
+    /** Build a drop_detected-like payload matching DeepgramStreamingClient output */
+    function makeDropPayload(overrides = {}) {
+      return {
+        code: 1006,
+        reason: 'abnormal closure',
+        sessionId: 'sess-1',
+        sessionStartTime: Date.now() - 30_000,
+        lastStreamTimestamp: 12.5,
+        reconnectAttempts: 0,
+        state: 'disconnected',
+        ...overrides,
+      };
+    }
+
+    it('emits drop_context with merged resilience state when drop_detected fires', () => {
+      const contexts = [];
+      resilience.on('drop_context', (ctx) => contexts.push(ctx));
+
+      // Trigger drop_detected on the underlying fake client
+      client.emit('drop_detected', makeDropPayload());
+
+      assert.equal(contexts.length, 1);
+      const ctx = contexts[0];
+      // Fields from Deepgram client context
+      assert.equal(ctx.sessionId, 'sess-1');
+      assert.equal(ctx.lastStreamTimestamp, 12.5);
+      assert.ok(typeof ctx.sessionStartTime === 'number');
+      // Fields added by resilience layer
+      assert.ok('bufferedPackets' in ctx, 'missing bufferedPackets');
+      assert.ok('droppedPackets' in ctx, 'missing droppedPackets');
+      assert.ok('detectedAt' in ctx, 'missing detectedAt');
+      assert.ok(ctx.detectedAt > 0);
+      // Close info preserved
+      assert.equal(ctx.closeCode, 1006);
+      assert.equal(ctx.closeReason, 'abnormal closure');
+    });
+
+    it('lastDropContext getter returns context after drop_detected', () => {
+      assert.equal(resilience.lastDropContext, null);
+
+      client.emit('drop_detected', makeDropPayload({ lastStreamTimestamp: 7.3 }));
+
+      const ctx = resilience.lastDropContext;
+      assert.notEqual(ctx, null);
+      assert.equal(ctx.lastStreamTimestamp, 7.3);
+    });
+
+    it('lastDropContext is a copy, not a reference', () => {
+      client.emit('drop_detected', makeDropPayload());
+      const ctx1 = resilience.lastDropContext;
+      const ctx2 = resilience.lastDropContext;
+      // Both are equal but not the same object
+      assert.deepEqual(ctx1, ctx2);
+      assert.notStrictEqual(ctx1, ctx2);
+    });
+
+    it('lastDropContext cleared after successful reconnection', () => {
+      client.emit('connected');
+      client.emit('drop_detected', makeDropPayload());
+      assert.notEqual(resilience.lastDropContext, null);
+
+      // Simulate reconnect cycle: degraded → reconnecting → connected
+      client.emit('reconnecting', { attempt: 1, maxAttempts: 3, delayMs: 0 });
+      client.emit('connected'); // successful reconnect
+
+      assert.equal(resilience.lastDropContext, null);
+    });
+
+    it('drop_context bufferedPackets reflects packets buffered before drop', () => {
+      const contexts = [];
+      resilience.on('drop_context', (ctx) => contexts.push(ctx));
+
+      // Connect then enter degraded state with some buffered packets
+      client.emit('connected');
+      client.emit('reconnecting', { attempt: 1, maxAttempts: 10, delayMs: 0 });
+
+      resilience.bufferAudio(Buffer.from('pkt-1'));
+      resilience.bufferAudio(Buffer.from('pkt-2'));
+      resilience.bufferAudio(Buffer.from('pkt-3'));
+
+      // Now a drop is detected
+      client.emit('drop_detected', makeDropPayload());
+
+      assert.equal(contexts.length, 1);
+      assert.equal(contexts[0].bufferedPackets, 3);
+    });
+
+    it('getMetrics includes lastDropContext', () => {
+      client.emit('drop_detected', makeDropPayload({ lastStreamTimestamp: 99.9 }));
+
+      const metrics = resilience.getMetrics();
+      assert.ok(metrics.lastDropContext !== null);
+      assert.equal(metrics.lastDropContext.lastStreamTimestamp, 99.9);
+    });
+
+    it('destroy clears lastDropContext', () => {
+      client.emit('drop_detected', makeDropPayload());
+      assert.notEqual(resilience.lastDropContext, null);
+
+      resilience.destroy();
+      assert.equal(resilience.lastDropContext, null);
+    });
+
+    it('multiple drops accumulate only the latest context', () => {
+      client.emit('drop_detected', makeDropPayload({ lastStreamTimestamp: 5.0 }));
+      client.emit('drop_detected', makeDropPayload({ lastStreamTimestamp: 10.0 }));
+
+      // Only the most recent drop context is kept
+      assert.equal(resilience.lastDropContext.lastStreamTimestamp, 10.0);
+    });
+  });
 });

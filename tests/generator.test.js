@@ -5,6 +5,8 @@
  * - Minutes generation from transcript + metadata
  * - File saving to disk
  * - Discord channel delivery
+ * - Retry logic (exponential backoff up to MAX_DELIVERY_ATTEMPTS)
+ * - Fallback text-only notification when all retries fail
  * - Error handling and graceful degradation
  * - Empty transcript handling
  * - buildMetadata helper
@@ -23,7 +25,12 @@ import {
   sendMinutesToChannel,
   formatDurationSimple,
   MINUTES_DIR,
+  MAX_DELIVERY_ATTEMPTS,
+  _setDeliveryRetryDelayMs,
 } from '../src/minutes/generator.js';
+
+// Disable retry delays for all tests so the suite stays fast
+_setDeliveryRetryDelayMs(0);
 
 // --- Mock Factories ---
 
@@ -220,6 +227,8 @@ describe('MinutesGenerator - generateAndDeliverMinutes', () => {
     assert.ok(result.filePath !== null);
     assert.ok(result.filePath.endsWith('.md'));
     assert.ok(result.generationTimeMs >= 0);
+    assert.equal(result.deliverySuccess, true);
+    assert.equal(result.deliveryError, null);
 
     // Should send file to Discord channel
     assert.equal(client._sendMock.mock.callCount(), 1);
@@ -275,6 +284,8 @@ describe('MinutesGenerator - generateAndDeliverMinutes', () => {
     // Should still succeed (save to disk) even without Discord client
     assert.equal(result.success, true);
     assert.ok(result.filePath !== null);
+    // Delivery was not possible (no client) — not an error per se
+    assert.equal(result.deliverySuccess, false);
 
     // Cleanup
     try { await rm(result.filePath); } catch {}
@@ -327,34 +338,6 @@ describe('MinutesGenerator - generateAndDeliverMinutes', () => {
     try { await rm(result.filePath); } catch {}
   });
 
-  it('should handle Discord send failure gracefully', async () => {
-    const transcript = createMockTranscript(2);
-    const session = createMockSession({ transcript });
-    const transcriptResult = createMockTranscriptResult(transcript);
-    const client = createMockClient();
-
-    // Make send fail
-    client._sendMock.mock.mockImplementation(async () => {
-      throw new Error('Discord API error');
-    });
-
-    // Should still report as failed since send throws
-    // But the file should be saved
-    const result = await generateAndDeliverMinutes({
-      transcript,
-      session,
-      transcriptResult,
-      client,
-      reason: 'manual_stop',
-      duration: 20,
-    });
-
-    // The pipeline catches Discord send errors internally
-    // It will fail because sendMinutesToChannel throws
-    assert.equal(result.success, false);
-    assert.ok(result.error.includes('Discord API error'));
-  });
-
   it('should work for Korean language sessions', async () => {
     const transcript = createMockTranscript(3);
     const session = createMockSession({ language: 'ko', transcript });
@@ -375,6 +358,238 @@ describe('MinutesGenerator - generateAndDeliverMinutes', () => {
     // Check Korean-language summary was sent
     const sendArg = client._sendMock.mock.calls[0].arguments[0];
     assert.ok(sendArg.content.includes('회의록'));
+
+    // Cleanup
+    try { await rm(result.filePath); } catch {}
+  });
+});
+
+describe('MinutesGenerator - Discord delivery retry logic', () => {
+  it('should succeed on 2nd attempt when 1st send fails (transient error)', async () => {
+    const transcript = createMockTranscript(2);
+    const session = createMockSession({ transcript });
+    const transcriptResult = createMockTranscriptResult(transcript);
+    const client = createMockClient();
+
+    let callCount = 0;
+    client._sendMock.mock.mockImplementation(async (...args) => {
+      callCount++;
+      if (callCount === 1) {
+        throw new Error('Transient network error');
+      }
+      return {};
+    });
+
+    const result = await generateAndDeliverMinutes({
+      transcript,
+      session,
+      transcriptResult,
+      client,
+      reason: 'manual_stop',
+      duration: 20,
+    });
+
+    // File should be saved and delivery should succeed (on retry)
+    assert.equal(result.success, true);
+    assert.ok(result.filePath !== null);
+    assert.equal(result.deliverySuccess, true);
+    assert.equal(result.deliveryError, null);
+
+    // send() should have been called exactly twice (1 fail + 1 success)
+    assert.equal(client._sendMock.mock.callCount(), 2);
+
+    // Cleanup
+    try { await rm(result.filePath); } catch {}
+  });
+
+  it('should succeed on 3rd attempt when first 2 sends fail', async () => {
+    const transcript = createMockTranscript(2);
+    const session = createMockSession({ transcript });
+    const transcriptResult = createMockTranscriptResult(transcript);
+    const client = createMockClient();
+
+    let callCount = 0;
+    client._sendMock.mock.mockImplementation(async () => {
+      callCount++;
+      if (callCount < MAX_DELIVERY_ATTEMPTS) {
+        throw new Error('Transient error');
+      }
+      return {};
+    });
+
+    const result = await generateAndDeliverMinutes({
+      transcript,
+      session,
+      transcriptResult,
+      client,
+      reason: 'manual_stop',
+      duration: 20,
+    });
+
+    assert.equal(result.success, true);
+    assert.equal(result.deliverySuccess, true);
+    assert.equal(result.deliveryError, null);
+    assert.equal(client._sendMock.mock.callCount(), MAX_DELIVERY_ATTEMPTS);
+
+    // Cleanup
+    try { await rm(result.filePath); } catch {}
+  });
+
+  it('should exhaust retries and report deliveryError when all attempts fail', async () => {
+    const transcript = createMockTranscript(2);
+    const session = createMockSession({ transcript });
+    const transcriptResult = createMockTranscriptResult(transcript);
+    const client = createMockClient();
+
+    client._sendMock.mock.mockImplementation(async () => {
+      throw new Error('Discord API error');
+    });
+
+    const result = await generateAndDeliverMinutes({
+      transcript,
+      session,
+      transcriptResult,
+      client,
+      reason: 'manual_stop',
+      duration: 20,
+    });
+
+    // File IS saved to disk even though delivery failed → success: true
+    assert.equal(result.success, true, 'Pipeline should succeed because file was saved to disk');
+    assert.ok(result.filePath !== null, 'File path should be set (file was saved)');
+    assert.equal(result.deliverySuccess, false, 'Delivery should be marked as failed');
+    assert.ok(
+      result.deliveryError !== null && result.deliveryError.includes('Discord API error'),
+      `deliveryError should contain the Discord error message, got: ${result.deliveryError}`
+    );
+
+    // send() should have been called MAX_DELIVERY_ATTEMPTS times for retries,
+    // plus 1 more for the fallback text notification (which also fails silently).
+    assert.equal(
+      client._sendMock.mock.callCount(),
+      MAX_DELIVERY_ATTEMPTS + 1,
+      `send() should be called ${MAX_DELIVERY_ATTEMPTS} retry times + 1 fallback notification`
+    );
+
+    // Cleanup
+    try { await rm(result.filePath); } catch {}
+  });
+
+  it('should send fallback text-only notification after all retries fail', async () => {
+    const transcript = createMockTranscript(2);
+    const session = createMockSession({ transcript });
+    const transcriptResult = createMockTranscriptResult(transcript);
+    const client = createMockClient();
+
+    let callCount = 0;
+    client._sendMock.mock.mockImplementation(async (payload) => {
+      callCount++;
+      // First MAX_DELIVERY_ATTEMPTS calls are the file-delivery attempts — all fail.
+      // The (MAX_DELIVERY_ATTEMPTS + 1)th call is the fallback text notification.
+      if (callCount <= MAX_DELIVERY_ATTEMPTS) {
+        throw new Error('File attachment error');
+      }
+      // Fallback text-only message succeeds
+      return {};
+    });
+
+    const result = await generateAndDeliverMinutes({
+      transcript,
+      session,
+      transcriptResult,
+      client,
+      reason: 'manual_stop',
+      duration: 20,
+    });
+
+    assert.equal(result.success, true);
+    assert.equal(result.deliverySuccess, false);
+
+    // Total calls = MAX_DELIVERY_ATTEMPTS (file failures) + 1 (fallback notification)
+    assert.equal(
+      client._sendMock.mock.callCount(),
+      MAX_DELIVERY_ATTEMPTS + 1,
+      'Expected retries + 1 fallback notification call'
+    );
+
+    // The last call (fallback) should be text-only (no files attachment)
+    const lastCall = client._sendMock.mock.calls[MAX_DELIVERY_ATTEMPTS].arguments[0];
+    assert.ok(!lastCall.files, 'Fallback notification should have no file attachment');
+    assert.ok(
+      lastCall.content.includes('saved to disk') || lastCall.content.includes('디스크에 저장'),
+      'Fallback should mention file saved to disk'
+    );
+    assert.ok(
+      lastCall.content.includes('⚠️'),
+      'Fallback should include warning emoji'
+    );
+
+    // Cleanup
+    try { await rm(result.filePath); } catch {}
+  });
+
+  it('should send Korean fallback notification for ko-language sessions', async () => {
+    const transcript = createMockTranscript(2);
+    const session = createMockSession({ language: 'ko', transcript });
+    const transcriptResult = createMockTranscriptResult(transcript);
+    const client = createMockClient();
+
+    let callCount = 0;
+    client._sendMock.mock.mockImplementation(async () => {
+      callCount++;
+      if (callCount <= MAX_DELIVERY_ATTEMPTS) {
+        throw new Error('전송 오류');
+      }
+      return {};
+    });
+
+    const result = await generateAndDeliverMinutes({
+      transcript,
+      session,
+      transcriptResult,
+      client,
+      reason: 'manual_stop',
+      duration: 20,
+    });
+
+    assert.equal(result.success, true);
+    assert.equal(result.deliverySuccess, false);
+
+    // The fallback call should use Korean phrasing
+    const fallbackCall = client._sendMock.mock.calls[MAX_DELIVERY_ATTEMPTS].arguments[0];
+    assert.ok(
+      fallbackCall.content.includes('회의록') || fallbackCall.content.includes('디스크에 저장'),
+      'Korean session fallback should use Korean phrases'
+    );
+
+    // Cleanup
+    try { await rm(result.filePath); } catch {}
+  });
+
+  it('should survive silently when fallback notification also fails', async () => {
+    const transcript = createMockTranscript(2);
+    const session = createMockSession({ transcript });
+    const transcriptResult = createMockTranscriptResult(transcript);
+    const client = createMockClient();
+
+    // ALL send calls fail (file delivery AND fallback notification)
+    client._sendMock.mock.mockImplementation(async () => {
+      throw new Error('Complete Discord outage');
+    });
+
+    // Should NOT throw — pipeline handles it gracefully
+    const result = await generateAndDeliverMinutes({
+      transcript,
+      session,
+      transcriptResult,
+      client,
+      reason: 'manual_stop',
+      duration: 20,
+    });
+
+    assert.equal(result.success, true, 'Pipeline should still succeed (file was saved)');
+    assert.ok(result.filePath !== null);
+    assert.equal(result.deliverySuccess, false);
 
     // Cleanup
     try { await rm(result.filePath); } catch {}

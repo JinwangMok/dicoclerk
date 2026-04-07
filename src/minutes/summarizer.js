@@ -665,6 +665,330 @@ export function formatSummaryForAgent(result) {
   return parts.join('\n');
 }
 
+/**
+ * Parse a meeting minutes markdown file into fully structured JSON data.
+ *
+ * Unlike summarizeSingleMinutes (which produces a compact digest for agent
+ * consumption), this returns a richer, more complete structure with every
+ * section preserved as first-class data:
+ *   - Meeting metadata (session id, date/time, channel, guild, participants)
+ *   - Parsed summary text
+ *   - Key discussion points (array of strings)
+ *   - Action items (task, assignee, deadline)
+ *   - Decisions
+ *   - Attendees table rows (name, role, utterance_count)
+ *   - Statistics (utterance count, section count, etc.)
+ *   - Optionally: parsed transcript entries
+ *   - Optionally: raw markdown source
+ *
+ * @param {Object} entry - MinutesIndexEntry metadata from the index store
+ * @param {string} content - Full markdown content of the minutes file
+ * @param {Object} [options]
+ * @param {boolean} [options.includeTranscript=false] - Include parsed transcript entries
+ * @param {boolean} [options.includeRawMarkdown=false] - Include raw markdown source
+ * @returns {Object} Fully structured minutes data object
+ */
+export function parseMinutesToStructuredData(entry, content, options = {}) {
+  const {
+    includeTranscript = false,
+    includeRawMarkdown = false,
+  } = options;
+
+  const sections = parseMarkdownSections(content);
+
+  // Reuse existing extractors (no artificial caps — return all found items)
+  const keyDiscussionPoints = extractKeyTopics(sections, 100, null);
+  const actionItems = extractActionItems(sections, 100);
+  const decisions = extractDecisions(sections);
+  const stats = extractStats(sections, content);
+
+  // --- Extract summary/overview section text ---
+  const summaryKeys = ['Summary', '요약', 'Overview', '개요', 'Executive Summary'];
+  let summaryText = null;
+  for (const key of summaryKeys) {
+    for (const [sectionName, sectionContent] of sections) {
+      if (sectionName.includes(key) && sectionContent.trim()) {
+        summaryText = sectionContent.trim();
+        break;
+      }
+    }
+    if (summaryText !== null) break;
+  }
+
+  // --- Parse attendees table ---
+  const attendees = [];
+  const attendeeKeys = ['Attendees', '참석자'];
+  outer:
+  for (const key of attendeeKeys) {
+    for (const [sectionName, sectionContent] of sections) {
+      if (!sectionName.includes(key) || !sectionContent) continue;
+      const lines = sectionContent.split('\n');
+      let headerRowsSeen = 0;
+      for (const line of lines) {
+        if (!line.trim().startsWith('|')) continue;
+        headerRowsSeen++;
+        if (headerRowsSeen <= 2) continue; // skip header row and separator
+        const cells = line.split('|').map(c => c.trim()).filter(Boolean);
+        if (cells.length === 0 || cells[0] === '---') continue;
+        attendees.push({
+          name: cells[0],
+          role: cells[1] ?? null,
+          utterance_count: cells[2] ? (parseInt(cells[2], 10) || null) : null,
+        });
+      }
+      if (attendees.length > 0) break outer;
+    }
+  }
+
+  // --- Parse transcript section into structured entries ---
+  let transcriptEntries = null;
+  if (includeTranscript) {
+    const transcriptKeys = ['Full Transcript', '전체 녹취록', 'Transcript', '녹취록'];
+    for (const key of transcriptKeys) {
+      for (const [sectionName, sectionContent] of sections) {
+        if (!sectionName.includes(key) || !sectionContent) continue;
+        transcriptEntries = [];
+        for (const line of sectionContent.split('\n')) {
+          const trimmed = line.trim();
+          if (!trimmed || trimmed.startsWith('|') || trimmed.startsWith('#') || trimmed.startsWith('---')) continue;
+
+          // Format: [HH:MM:SS] **Speaker**: text
+          const withTimestamp = trimmed.match(/^\[(\d{2}:\d{2}:\d{2})\]\s+\*\*(.+?)\*\*[:\s]+(.+)$/);
+          if (withTimestamp) {
+            transcriptEntries.push({ timestamp: withTimestamp[1], speaker: withTimestamp[2], text: withTimestamp[3].trim() });
+            continue;
+          }
+
+          // Format: **Speaker**: text
+          const withBold = trimmed.match(/^\*\*(.+?)\*\*[:\s]+(.+)$/);
+          if (withBold) {
+            transcriptEntries.push({ timestamp: null, speaker: withBold[1], text: withBold[2].trim() });
+            continue;
+          }
+
+          // Format: Speaker: text (plain)
+          const plain = trimmed.match(/^([^:]+):\s+(.+)$/);
+          if (plain) {
+            transcriptEntries.push({ timestamp: null, speaker: plain[1].trim(), text: plain[2].trim() });
+          }
+        }
+        break;
+      }
+      if (transcriptEntries !== null) break;
+    }
+  }
+
+  // --- Duration formatting ---
+  const durationSeconds = entry.durationSeconds ?? 0;
+  const dh = Math.floor(durationSeconds / 3600);
+  const dm = Math.floor((durationSeconds % 3600) / 60);
+  const ds = durationSeconds % 60;
+  const durationFormatted = dh > 0 ? `${dh}h ${dm}m ${ds}s` : `${dm}m ${ds}s`;
+
+  // --- Assemble result ---
+  const result = {
+    session_id: entry.sessionId,
+    date: entry.date,
+    time: entry.time,
+    started_at: entry.startedAt,
+    duration_seconds: durationSeconds,
+    duration_formatted: durationFormatted,
+    guild_id: entry.guildId,
+    guild_name: entry.guildName,
+    channel_id: entry.channelId,
+    channel_name: entry.channelName,
+    participants: entry.participants ?? [],
+    participant_count: entry.participantCount ?? (entry.participants?.length ?? 0),
+    language: entry.language,
+    started_by: entry.startedBy,
+    filename: entry.filename,
+    structured_content: {
+      summary: summaryText,
+      key_discussion_points: keyDiscussionPoints,
+      action_items: actionItems,
+      decisions,
+      attendees,
+      statistics: {
+        ...stats,
+        duration_minutes: Math.round(durationSeconds / 60),
+      },
+    },
+  };
+
+  if (includeTranscript && transcriptEntries !== null) {
+    result.structured_content.transcript = transcriptEntries;
+  }
+
+  if (includeRawMarkdown) {
+    result.raw_markdown = content;
+  }
+
+  return result;
+}
+
+/**
+ * Build a compact, token-efficient agent digest from a ContextualSummaryResult.
+ *
+ * Unlike `formatSummaryForAgent` (which produces verbose Markdown for human
+ * review), this function produces a structured, abbreviated text format that
+ * prioritises information density — every token carries meaning.  It is
+ * designed for inclusion in an Openclaw agent's context window where token
+ * budget is limited.
+ *
+ * Output structure:
+ *   MEETING DIGEST — N meeting(s) | <date range> | ~Xmin total
+ *
+ *   SESSION <n> | <date> <time> | <channel> | <duration>min | <participants>
+ *   > <one-line narrative>
+ *
+ *   ACTION ITEMS (<total>):
+ *   [ ] <task> | <assignee|–> | <deadline|–> | from <date>
+ *
+ *   DECISIONS (<total>):
+ *   • <decision> [<date>]
+ *
+ *   KEY TOPICS (<total>):
+ *   • <topic>
+ *
+ *   [FOCUS: "<focus_query>" — relevant meetings: …]
+ *
+ * @param {ContextualSummaryResult} result
+ * @param {Object} [options]
+ * @param {string|null} [options.focusQuery]       - Highlight focus query context
+ * @param {number}      [options.maxActionItems=20] - Cap on aggregated action items
+ * @param {number}      [options.maxDecisions=15]   - Cap on aggregated decisions
+ * @param {number}      [options.maxTopics=10]       - Cap on aggregated key topics
+ * @returns {string}
+ */
+export function buildAgentDigest(result, options = {}) {
+  const {
+    focusQuery = null,
+    maxActionItems = 20,
+    maxDecisions = 15,
+    maxTopics = 10,
+  } = options;
+
+  if (!result || result.meetingCount === 0) {
+    return 'MEETING DIGEST — 0 meeting(s) | No records found.';
+  }
+
+  const lines = [];
+
+  // ── Header ──────────────────────────────────────────────────────────────
+  const dates = result.summaries.map(s => s.date).filter(Boolean).sort();
+  const dateRange = dates.length > 1
+    ? `${dates[0]} to ${dates[dates.length - 1]}`
+    : (dates[0] ?? 'unknown date');
+  const totalMinutes = result.summaries.reduce(
+    (sum, s) => sum + Math.round((s.durationSeconds ?? 0) / 60), 0
+  );
+
+  lines.push(
+    `MEETING DIGEST — ${result.meetingCount} meeting(s) | ${dateRange} | ~${totalMinutes}min total`
+  );
+  lines.push('');
+
+  // ── Per-meeting session blocks ───────────────────────────────────────────
+  result.summaries.forEach((summary, idx) => {
+    const durationMin = Math.round((summary.durationSeconds ?? 0) / 60);
+    const participantStr = summary.participants.length > 0
+      ? summary.participants.join(', ')
+      : 'N/A';
+
+    lines.push(
+      `SESSION ${idx + 1} | ${summary.date} ${summary.time} | ${summary.channelName} | ${durationMin}min | ${participantStr}`
+    );
+    if (summary.narrativeSummary) {
+      // Condense to single line
+      const oneLiner = summary.narrativeSummary.replace(/\n+/g, ' ').trim();
+      lines.push(`> ${oneLiner}`);
+    }
+    lines.push('');
+  });
+
+  // ── Aggregated Action Items ──────────────────────────────────────────────
+  const allActions = [];
+  result.summaries.forEach(s => {
+    s.actionItems.forEach(a => allActions.push({ ...a, fromDate: s.date }));
+  });
+  const cappedActions = allActions.slice(0, maxActionItems);
+
+  if (cappedActions.length > 0) {
+    lines.push(`ACTION ITEMS (${allActions.length} total${allActions.length > maxActionItems ? `, showing ${maxActionItems}` : ''}):`);
+    cappedActions.forEach(a => {
+      const assignee = a.assignee ?? '–';
+      const deadline = a.deadline ?? '–';
+      lines.push(`[ ] ${a.task} | ${assignee} | ${deadline} | from ${a.fromDate}`);
+    });
+    lines.push('');
+  }
+
+  // ── Aggregated Decisions ─────────────────────────────────────────────────
+  const allDecisions = [];
+  result.summaries.forEach(s => {
+    s.decisions.forEach(d => allDecisions.push({ text: d, date: s.date }));
+  });
+  const cappedDecisions = allDecisions.slice(0, maxDecisions);
+
+  if (cappedDecisions.length > 0) {
+    lines.push(`DECISIONS (${allDecisions.length} total${allDecisions.length > maxDecisions ? `, showing ${maxDecisions}` : ''}):`);
+    cappedDecisions.forEach(d => {
+      lines.push(`• ${d.text} [${d.date}]`);
+    });
+    lines.push('');
+  }
+
+  // ── Aggregated Key Topics ────────────────────────────────────────────────
+  const seenTopics = new Set();
+  const allTopics = [];
+  result.summaries.forEach(s => {
+    s.keyTopics.forEach(t => {
+      if (!seenTopics.has(t)) {
+        seenTopics.add(t);
+        allTopics.push(t);
+      }
+    });
+  });
+  const cappedTopics = allTopics.slice(0, maxTopics);
+
+  if (cappedTopics.length > 0) {
+    lines.push(`KEY TOPICS (${allTopics.length} total${allTopics.length > maxTopics ? `, showing ${maxTopics}` : ''}):`);
+    cappedTopics.forEach(t => lines.push(`• ${t}`));
+    lines.push('');
+  }
+
+  // ── Focus Query Context ──────────────────────────────────────────────────
+  if (focusQuery) {
+    const q = focusQuery.toLowerCase();
+    const relevantMeetings = result.summaries.filter(s =>
+      s.narrativeSummary.toLowerCase().includes(q) ||
+      s.keyTopics.some(t => t.toLowerCase().includes(q)) ||
+      s.decisions.some(d => d.toLowerCase().includes(q)) ||
+      s.actionItems.some(a => a.task.toLowerCase().includes(q))
+    );
+
+    lines.push(`FOCUS: "${focusQuery}"`);
+    if (relevantMeetings.length > 0) {
+      lines.push(
+        `Relevant meeting(s): ${relevantMeetings.map(s => `${s.date} (${s.channelName})`).join(', ')}`
+      );
+      // Surface action items and decisions mentioning the query
+      const focusActions = allActions.filter(a => a.task.toLowerCase().includes(q));
+      if (focusActions.length > 0) {
+        lines.push(`Related action items:`);
+        focusActions.slice(0, 5).forEach(a => {
+          lines.push(`  [ ] ${a.task} | ${a.assignee ?? '–'} | ${a.deadline ?? '–'}`);
+        });
+      }
+    } else {
+      lines.push(`No meetings directly mention "${focusQuery}".`);
+    }
+    lines.push('');
+  }
+
+  return lines.join('\n').trimEnd();
+}
+
 export {
   parseMarkdownSections,
   extractKeyTopics,

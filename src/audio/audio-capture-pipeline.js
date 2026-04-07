@@ -5,14 +5,21 @@
  * Supports two operating modes:
  *
  * 1. **Direct mode**: Attaches to a VoiceConnection's receiver, subscribes to
- *    per-user Opus streams on speaking events, and forwards packets to Deepgram.
+ *    per-user Opus streams on speaking events, and forwards audio to Deepgram.
  *
  * 2. **Consumer mode**: Accepts externally-provided Opus streams (e.g. from
  *    SessionManager's audioStream events) via `addStream(userId, stream)`.
  *
- * In both modes, Opus packets are forwarded directly to Deepgram (which natively
- * supports Opus decoding), and a userId-to-username map is maintained for
- * correlating Deepgram diarization with Discord user identities.
+ * Audio encoding pipeline:
+ *   Discord → raw Opus frames → OpusDecoderPool (per-user) → linear16 PCM → Deepgram
+ *
+ * When an `opusDecoder` (OpusDecoderPool) is provided, each Opus frame is decoded
+ * to mono linear16 PCM before being sent to Deepgram (encoding: 'linear16').
+ * When no decoder is provided the raw packet is forwarded as-is (passthrough mode,
+ * useful for unit tests or when Deepgram is configured for encoding: 'opus').
+ *
+ * A userId-to-username map is maintained for correlating Deepgram diarization
+ * labels with Discord user identities.
  */
 
 import { EventEmitter } from 'node:events';
@@ -26,10 +33,19 @@ const SILENCE_TIMEOUT_MS = 200;
 const MAX_CONCURRENT_STREAMS = 15;
 
 /**
+ * Per-user packet ring buffer capacity.
+ * At 20 ms/frame, 200 packets ≈ 4 seconds of buffered audio per user.
+ * When the buffer is full the oldest packet is evicted so new packets are
+ * always captured (tail-drop policy).
+ */
+const MAX_USER_BUFFER_PACKETS = 200;
+
+/**
  * @typedef {Object} AudioPipelineOptions
  * @property {import('../stt/deepgram-client.js').DeepgramStreamingClient} deepgramClient - Deepgram streaming client
  * @property {import('@discordjs/voice').VoiceConnection} [connection] - Discord voice connection (for direct mode)
  * @property {Function} [resolveUsername] - Async function to resolve userId -> display name
+ * @property {import('./opus-decoder.js').OpusDecoderPool} [opusDecoder] - Per-user Opus→linear16 decoder pool
  */
 
 /**
@@ -47,6 +63,7 @@ const MAX_CONCURRENT_STREAMS = 15;
  * - 'user_silent'      : { userId, username } - user stopped speaking
  * - 'audio_forwarded'  : { userId, byteLength } - audio packet sent to Deepgram
  * - 'audio_dropped'    : { userId, reason } - audio packet dropped
+ * - 'decode_error'     : { userId, error } - Opus decoding failed (packet skipped)
  * - 'error'            : Error - pipeline error
  * - 'warning'          : string - non-fatal issue
  */
@@ -59,6 +76,9 @@ export class AudioCapturePipeline extends EventEmitter {
 
   /** @type {import('../stt/deepgram-client.js').DeepgramStreamingClient} */
   #deepgramClient;
+
+  /** @type {import('./opus-decoder.js').OpusDecoderPool|null} */
+  #opusDecoder;
 
   /** @type {Map<string, UserStreamInfo>} userId -> stream info */
   #activeStreams;
@@ -85,9 +105,16 @@ export class AudioCapturePipeline extends EventEmitter {
   #speakerIdentifier;
 
   /**
+   * Per-user ring buffers for decoded audio packets queued while Deepgram
+   * is temporarily disconnected. Drained after reconnection.
+   * @type {Map<string, Buffer[]>}
+   */
+  #userBuffers;
+
+  /**
    * @param {AudioPipelineOptions} options
    */
-  constructor({ connection, deepgramClient, resolveUsername, speakerIdentifier } = {}) {
+  constructor({ connection, deepgramClient, resolveUsername, speakerIdentifier, opusDecoder } = {}) {
     super();
 
     if (!deepgramClient) throw new Error('DeepgramStreamingClient is required');
@@ -95,14 +122,23 @@ export class AudioCapturePipeline extends EventEmitter {
     this.#connection = connection || null;
     this.#receiver = connection?.receiver || null;
     this.#deepgramClient = deepgramClient;
+    this.#opusDecoder = opusDecoder || null;
     this.#resolveUsername = resolveUsername || (async (id) => `User-${id.slice(-4)}`);
     this.#activeStreams = new Map();
     this.#userMap = new Map();
+    this.#userBuffers = new Map();
     this.#running = false;
     this.#totalPackets = 0;
     this.#onSpeakingStart = null;
     this.#onSpeakingEnd = null;
     this.#speakerIdentifier = speakerIdentifier || new SpeakerIdentifier();
+
+    // Forward decode errors from the pool as pipeline events
+    if (this.#opusDecoder) {
+      this.#opusDecoder.on('decode_error', ({ userId, error }) => {
+        this.emit('decode_error', { userId, error });
+      });
+    }
   }
 
   /** The speaker identifier instance for mapping Deepgram labels to Discord users */
@@ -130,6 +166,22 @@ export class AudioCapturePipeline extends EventEmitter {
     return this.#totalPackets;
   }
 
+  /** Whether Opus→PCM decoding is active */
+  get isDecoding() {
+    return this.#opusDecoder !== null;
+  }
+
+  /**
+   * Total decoded audio packets currently held in per-user ring buffers.
+   * Non-zero only during a Deepgram disconnection window.
+   * @type {number}
+   */
+  get bufferedPacketCount() {
+    let total = 0;
+    for (const buf of this.#userBuffers.values()) total += buf.length;
+    return total;
+  }
+
   /**
    * Start capturing audio.
    * In direct mode (with connection), subscribes to speaking events.
@@ -152,7 +204,8 @@ export class AudioCapturePipeline extends EventEmitter {
       this.#receiver.speaking.on('end', this.#onSpeakingEnd);
     }
 
-    console.log(`[AudioPipeline] Started — mode=${this.#receiver ? 'direct' : 'consumer'}`);
+    const decoderMode = this.#opusDecoder ? 'opus→linear16' : 'passthrough';
+    console.log(`[AudioPipeline] Started — mode=${this.#receiver ? 'direct' : 'consumer'} encoding=${decoderMode}`);
   }
 
   /**
@@ -178,6 +231,15 @@ export class AudioCapturePipeline extends EventEmitter {
       this.#destroyUserStream(userId, 'pipeline_stopped');
     }
     this.#activeStreams.clear();
+
+    // Destroy the Opus decoder pool to free WebAssembly memory
+    if (this.#opusDecoder) {
+      this.#opusDecoder.destroy();
+      this.#opusDecoder = null;
+    }
+
+    // Discard all per-user packet buffers
+    this.#userBuffers.clear();
 
     console.log(`[AudioPipeline] Stopped — total packets forwarded: ${this.#totalPackets}`);
   }
@@ -323,19 +385,63 @@ export class AudioCapturePipeline extends EventEmitter {
   }
 
   /**
-   * Forward an Opus audio packet from a user to Deepgram.
+   * Forward an audio packet from a user to Deepgram.
+   *
+   * Decoding always happens BEFORE the connectivity check so that the
+   * per-user Opus codec state advances in step with the incoming stream.
+   * This prevents desynchronisation when the connection is restored and
+   * we replay buffered PCM frames.
+   *
+   * When Deepgram is connected:   decoded PCM is sent immediately.
+   * When Deepgram is disconnected: decoded PCM is queued in a per-user
+   *   ring buffer (capacity MAX_USER_BUFFER_PACKETS). The oldest packet
+   *   is evicted when the buffer is full (tail-drop, with 'audio_dropped'
+   *   emitted as reason 'buffer_overflow').
+   *
+   * In passthrough mode (no decoder), the raw packet is forwarded / buffered.
+   *
    * @param {string} userId
-   * @param {Buffer} opusPacket - Raw Opus packet from Discord
+   * @param {Buffer} opusPacket - Raw Opus packet from Discord's voice receiver
    */
   #forwardAudio(userId, opusPacket) {
     if (!this.#running) return;
 
+    // --- Step 1: Decode Opus → linear16 PCM (always, to keep codec state current) ---
+    let audioData = opusPacket;
+    if (this.#opusDecoder) {
+      const pcm = this.#opusDecoder.decode(userId, opusPacket);
+      if (pcm === null) {
+        // decode() already emitted 'decode_error'; drop the packet
+        this.emit('audio_dropped', { userId, reason: 'decode_failed' });
+        return;
+      }
+      audioData = pcm;
+    }
+
+    // --- Step 2: Send or buffer ---
     if (!this.#deepgramClient.isConnected) {
-      this.emit('audio_dropped', { userId, reason: 'deepgram_not_connected' });
+      // Buffer the decoded packet for replay after reconnection
+      let buf = this.#userBuffers.get(userId);
+      if (!buf) {
+        buf = [];
+        this.#userBuffers.set(userId, buf);
+      }
+
+      if (buf.length >= MAX_USER_BUFFER_PACKETS) {
+        // Evict oldest to make room (tail-drop)
+        buf.shift();
+        this.emit('audio_dropped', { userId, reason: 'buffer_overflow' });
+      }
+
+      buf.push(audioData);
+      this.emit('audio_buffered', { userId, bufferedCount: buf.length });
       return;
     }
 
-    const sent = this.#deepgramClient.send(opusPacket);
+    // Drain any buffered packets for this user before sending the new one
+    this.#drainUserBuffer(userId);
+
+    const sent = this.#deepgramClient.send(audioData);
 
     if (sent) {
       this.#totalPackets++;
@@ -346,14 +452,72 @@ export class AudioCapturePipeline extends EventEmitter {
       // with the audio time window so Deepgram speaker labels can be mapped back
       this.#speakerIdentifier.recordActivity(userId);
 
-      this.emit('audio_forwarded', { userId, byteLength: opusPacket.length });
+      this.emit('audio_forwarded', { userId, byteLength: audioData.length });
     } else {
       this.emit('audio_dropped', { userId, reason: 'send_failed' });
     }
   }
 
   /**
+   * Drain the per-user buffer for one user, sending all queued packets.
+   * @param {string} userId
+   * @returns {number} packets successfully sent
+   */
+  #drainUserBuffer(userId) {
+    const buf = this.#userBuffers.get(userId);
+    if (!buf || buf.length === 0) return 0;
+
+    let sent = 0;
+    while (buf.length > 0 && this.#deepgramClient.isConnected) {
+      const packet = buf.shift();
+      if (this.#deepgramClient.send(packet)) {
+        sent++;
+        this.#totalPackets++;
+        const info = this.#activeStreams.get(userId);
+        if (info) info.packetCount++;
+        this.#speakerIdentifier.recordActivity(userId);
+      } else {
+        // Send failed — put it back at the front and stop draining
+        buf.unshift(packet);
+        break;
+      }
+    }
+
+    if (sent > 0) {
+      this.emit('buffer_drained', { userId, drainedCount: sent });
+    }
+
+    return sent;
+  }
+
+  /**
+   * Drain all per-user packet buffers by attempting to send each buffered
+   * packet to Deepgram immediately.
+   *
+   * Call this after a Deepgram reconnection so that audio captured during
+   * the outage is forwarded before new live packets arrive.
+   *
+   * @returns {number} Total packets successfully drained across all users.
+   */
+  drainAllUserBuffers() {
+    if (!this.#running) return 0;
+    if (!this.#deepgramClient.isConnected) return 0;
+
+    let total = 0;
+    for (const [userId] of this.#userBuffers) {
+      total += this.#drainUserBuffer(userId);
+    }
+
+    if (total > 0) {
+      console.log(`[AudioPipeline] Drained ${total} buffered packets across all users after reconnect`);
+    }
+
+    return total;
+  }
+
+  /**
    * Clean up a user's audio stream after it ends.
+   * Also releases the per-user Opus decoder if one is held.
    * @param {string} userId
    */
   #cleanupUserStream(userId) {
@@ -361,6 +525,14 @@ export class AudioCapturePipeline extends EventEmitter {
     if (!info) return;
 
     this.#activeStreams.delete(userId);
+
+    // Release per-user Opus decoder to free WebAssembly memory
+    if (this.#opusDecoder) {
+      this.#opusDecoder.deleteDecoder(userId);
+    }
+
+    // Discard any buffered packets for this user
+    this.#userBuffers.delete(userId);
 
     const duration = Date.now() - info.startedAt;
     console.log(
@@ -370,6 +542,7 @@ export class AudioCapturePipeline extends EventEmitter {
 
   /**
    * Forcefully destroy a user's audio stream.
+   * Also releases the per-user Opus decoder if one is held.
    * @param {string} userId
    * @param {string} reason
    */
@@ -385,6 +558,11 @@ export class AudioCapturePipeline extends EventEmitter {
       this.emit('error', new Error(`Failed to destroy stream for ${userId}: ${err.message}`));
     }
 
+    // Release per-user Opus decoder to free WebAssembly memory
+    if (this.#opusDecoder) {
+      this.#opusDecoder.deleteDecoder(userId);
+    }
+
     console.log(
       `[AudioPipeline] Stream destroyed: user=${info.username} reason=${reason} packets=${info.packetCount}`
     );
@@ -392,15 +570,20 @@ export class AudioCapturePipeline extends EventEmitter {
 
   /**
    * Get current pipeline statistics.
-   * @returns {{ running: boolean, activeStreams: number, totalPackets: number, participants: number, users: Array }}
+   * @returns {{ running: boolean, activeStreams: number, totalPackets: number, participants: number, users: Array, decoderStats: Object|null }}
    */
   getStats() {
+    let totalBufferedPackets = 0;
     const users = [];
+
     for (const [userId, info] of this.#activeStreams) {
+      const bufferedPackets = this.#userBuffers.get(userId)?.length ?? 0;
+      totalBufferedPackets += bufferedPackets;
       users.push({
         userId,
         username: info.username,
         packetCount: info.packetCount,
+        bufferedPackets,
         duration: Date.now() - info.startedAt,
       });
     }
@@ -409,8 +592,16 @@ export class AudioCapturePipeline extends EventEmitter {
       running: this.#running,
       activeStreams: this.#activeStreams.size,
       totalPackets: this.#totalPackets,
+      totalBufferedPackets,
       participants: this.#userMap.size,
       users,
+      decoderStats: this.#opusDecoder
+        ? {
+            activeDecoders: this.#opusDecoder.activeDecoderCount,
+            decodedPackets: this.#opusDecoder.decodedCount,
+            decodeErrors: this.#opusDecoder.errorCount,
+          }
+        : null,
     };
   }
 
@@ -425,4 +616,4 @@ export class AudioCapturePipeline extends EventEmitter {
   }
 }
 
-export { SILENCE_TIMEOUT_MS, MAX_CONCURRENT_STREAMS };
+export { SILENCE_TIMEOUT_MS, MAX_CONCURRENT_STREAMS, MAX_USER_BUFFER_PACKETS };

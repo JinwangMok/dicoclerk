@@ -6,6 +6,7 @@ import assert from 'node:assert/strict';
 import {
   generateContextualSummary,
   formatSummaryForAgent,
+  buildAgentDigest,
   parseMarkdownSections,
   extractKeyTopics,
   extractActionItems,
@@ -365,5 +366,159 @@ describe('formatSummaryForAgent', () => {
 
     assert.ok(text.includes('2 meeting(s)'));
     assert.ok(text.includes('Cross-meeting summary') || text.includes('종합 요약'));
+  });
+});
+
+describe('buildAgentDigest', () => {
+  it('should return a no-records message for empty result', () => {
+    const empty = { meetingCount: 0, summaries: [], crossMeetingSummary: null, generatedAt: new Date().toISOString() };
+    const digest = buildAgentDigest(empty);
+    assert.ok(digest.includes('0 meeting(s)'));
+    assert.ok(digest.includes('No records found'));
+  });
+
+  it('should return a no-records message for null input', () => {
+    const digest = buildAgentDigest(null);
+    assert.ok(digest.includes('0 meeting(s)'));
+  });
+
+  it('should produce a compact digest for a single English meeting', () => {
+    const result = generateContextualSummary([
+      { entry: SAMPLE_ENTRY_EN, content: SAMPLE_MINUTES_EN },
+    ]);
+    const digest = buildAgentDigest(result);
+
+    assert.ok(digest.includes('MEETING DIGEST'));
+    assert.ok(digest.includes('1 meeting(s)'));
+    assert.ok(digest.includes('SESSION 1'));
+    assert.ok(digest.includes('dev-chat'));
+    assert.ok(digest.includes('ACTION ITEMS'));
+    assert.ok(digest.includes('DECISIONS'));
+    assert.ok(digest.includes('KEY TOPICS'));
+  });
+
+  it('should aggregate action items across multiple meetings', () => {
+    const result = generateContextualSummary([
+      { entry: SAMPLE_ENTRY_EN, content: SAMPLE_MINUTES_EN },
+      { entry: SAMPLE_ENTRY_KO, content: SAMPLE_MINUTES_KO },
+    ]);
+    const digest = buildAgentDigest(result);
+
+    assert.ok(digest.includes('SESSION 1'));
+    assert.ok(digest.includes('SESSION 2'));
+    // Action items from both meetings should appear
+    assert.ok(digest.includes('ACTION ITEMS'));
+    // Each action item line should follow the structured format
+    const lines = digest.split('\n');
+    const actionLines = lines.filter(l => l.startsWith('[ ]'));
+    assert.ok(actionLines.length > 0, 'Should have action item lines starting with [ ]');
+    // Verify each action item line has the pipe-delimited format
+    actionLines.forEach(line => {
+      assert.ok(line.includes(' | '), `Action line should have pipe delimiters: "${line}"`);
+    });
+  });
+
+  it('should aggregate decisions from all meetings with date attribution', () => {
+    const result = generateContextualSummary([
+      { entry: SAMPLE_ENTRY_EN, content: SAMPLE_MINUTES_EN },
+      { entry: SAMPLE_ENTRY_KO, content: SAMPLE_MINUTES_KO },
+    ]);
+    const digest = buildAgentDigest(result);
+
+    assert.ok(digest.includes('DECISIONS'));
+    const lines = digest.split('\n');
+    const decisionLines = lines.filter(l => l.startsWith('•') && l.includes('[2026-'));
+    assert.ok(decisionLines.length > 0, 'Should have decision lines with date tags');
+  });
+
+  it('should deduplicate key topics across meetings', () => {
+    const result = generateContextualSummary([
+      { entry: SAMPLE_ENTRY_EN, content: SAMPLE_MINUTES_EN },
+      { entry: SAMPLE_ENTRY_KO, content: SAMPLE_MINUTES_KO },
+    ]);
+    const digest = buildAgentDigest(result);
+
+    assert.ok(digest.includes('KEY TOPICS'));
+    const lines = digest.split('\n');
+    const topicLines = lines.filter(l => l.startsWith('•') && !l.includes('[2026-'));
+    // All topic lines should be unique text
+    const topics = topicLines.map(l => l.slice(2).trim());
+    const unique = new Set(topics);
+    assert.equal(topics.length, unique.size, 'Topics should not be duplicated in the digest');
+  });
+
+  it('should include FOCUS section when focusQuery is provided', () => {
+    const result = generateContextualSummary(
+      [{ entry: SAMPLE_ENTRY_EN, content: SAMPLE_MINUTES_EN }],
+      { focusQuery: 'database' }
+    );
+    const digest = buildAgentDigest(result, { focusQuery: 'database' });
+
+    assert.ok(digest.includes('FOCUS:'));
+    assert.ok(digest.includes('"database"'));
+  });
+
+  it('should report no relevant meetings when focus query has no matches', () => {
+    const result = generateContextualSummary([
+      { entry: SAMPLE_ENTRY_EN, content: SAMPLE_MINUTES_EN },
+    ]);
+    const digest = buildAgentDigest(result, { focusQuery: 'zzz_nonexistent_zzz' });
+
+    assert.ok(digest.includes('FOCUS:'));
+    assert.ok(digest.includes('No meetings directly mention'));
+  });
+
+  it('should include date range in header for multiple meetings', () => {
+    const result = generateContextualSummary([
+      { entry: SAMPLE_ENTRY_EN, content: SAMPLE_MINUTES_EN },
+      { entry: SAMPLE_ENTRY_KO, content: SAMPLE_MINUTES_KO },
+    ]);
+    const digest = buildAgentDigest(result);
+
+    // Should include both dates in range
+    assert.ok(digest.includes('2026-03-15'));
+    assert.ok(digest.includes('2026-03-20'));
+  });
+
+  it('should respect maxActionItems cap with count indicator', () => {
+    const result = generateContextualSummary([
+      { entry: SAMPLE_ENTRY_EN, content: SAMPLE_MINUTES_EN },
+      { entry: SAMPLE_ENTRY_KO, content: SAMPLE_MINUTES_KO },
+    ]);
+    const digest = buildAgentDigest(result, { maxActionItems: 1 });
+    const lines = digest.split('\n');
+    const actionItemLines = lines.filter(l => l.startsWith('[ ]'));
+    assert.ok(actionItemLines.length <= 1, `Should cap at 1 action item, got ${actionItemLines.length}`);
+    // Should indicate truncation in the header
+    const actionHeader = lines.find(l => l.startsWith('ACTION ITEMS'));
+    assert.ok(actionHeader, 'Should have ACTION ITEMS header');
+    assert.ok(actionHeader.includes('showing 1'), 'Should show cap indicator');
+  });
+
+  it('should produce narrower output than formatSummaryForAgent (token efficiency)', () => {
+    const result = generateContextualSummary([
+      { entry: SAMPLE_ENTRY_EN, content: SAMPLE_MINUTES_EN },
+      { entry: SAMPLE_ENTRY_KO, content: SAMPLE_MINUTES_KO },
+    ]);
+    const agentText = formatSummaryForAgent(result);
+    const digest = buildAgentDigest(result);
+
+    // The digest should be shorter (more token-efficient) than the full Markdown rendition
+    assert.ok(
+      digest.length < agentText.length,
+      `Digest (${digest.length} chars) should be shorter than agentFormattedText (${agentText.length} chars)`
+    );
+  });
+
+  it('should produce valid structured output for Korean meeting', () => {
+    const result = generateContextualSummary([
+      { entry: SAMPLE_ENTRY_KO, content: SAMPLE_MINUTES_KO },
+    ]);
+    const digest = buildAgentDigest(result);
+
+    assert.ok(digest.includes('SESSION 1'));
+    assert.ok(digest.includes('개발팀'));
+    // Korean participants
+    assert.ok(digest.includes('김철수') || digest.includes('이영희'));
   });
 });

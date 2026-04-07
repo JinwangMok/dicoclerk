@@ -14,7 +14,14 @@ import { join } from 'path';
 import { cleanupSession } from '../session/session-cleanup.js';
 import { generateAndDeliverMinutes } from '../minutes/generator.js';
 import { searchEntries, searchEntriesWithContent, getEntryBySessionId, getLatestEntry } from '../minutes/index-store.js';
-import { generateContextualSummary, formatSummaryForAgent } from '../minutes/summarizer.js';
+import { generateContextualSummary, formatSummaryForAgent, buildAgentDigest, parseMinutesToStructuredData } from '../minutes/summarizer.js';
+import { McpError, ErrorCode } from '@modelcontextprotocol/sdk/types.js';
+import {
+  errorContent,
+  requireParam,
+  validateDate,
+  validatePositiveInt,
+} from './validator.js';
 
 const DATA_DIR = join(process.cwd(), 'data');
 const TRANSCRIPTS_DIR = join(DATA_DIR, 'transcripts');
@@ -27,11 +34,269 @@ function textContent(text) {
   return { content: [{ type: 'text', text }] };
 }
 
+
 /**
- * Helper to create an error response.
+ * Join a Discord voice channel and return connection status.
+ *
+ * This is a lightweight connectivity tool that:
+ *   - Returns 'already_connected' if the bot is already in the requested channel
+ *     (via an active session).
+ *   - Returns 'session_active' if the bot is in a *different* channel for the guild.
+ *   - Otherwise joins the channel using VoiceConnectionManager, captures the
+ *     connection state, then cleanly disconnects, returning the result.
+ *
+ * Unlike start_session, this tool does NOT start STT/Deepgram processing.
+ * It is intended for agent diagnostics and pre-join connectivity checks.
+ *
+ * @param {object} deps - { client, sessionManager }
+ * @param {string} guildId - Discord guild ID
+ * @param {string} channelId - Voice channel ID to join
  */
-function errorContent(message) {
-  return { content: [{ type: 'text', text: `Error: ${message}` }], isError: true };
+export async function joinVoiceChannel(deps, guildId, channelId) {
+  const { client, sessionManager } = deps;
+
+  if (!client) {
+    return errorContent(
+      'Cannot join voice channels in standalone MCP mode. ' +
+      'The Discord bot must be running (node src/index.js).'
+    );
+  }
+
+  // Resolve guild
+  const guild = client.guilds.cache.get(guildId);
+  if (!guild) {
+    return errorContent(
+      `Guild ${guildId} not found. The bot may not be a member of this guild.`
+    );
+  }
+
+  // Resolve channel
+  const channel = guild.channels.cache.get(channelId);
+  if (!channel) {
+    return errorContent(
+      `Channel ${channelId} not found in guild ${guildId}.`
+    );
+  }
+  if (!channel.isVoiceBased?.()) {
+    return errorContent(
+      `Channel ${channelId} is not a voice channel.`
+    );
+  }
+
+  const channelName = channel.name ?? channelId;
+  const memberCount = channel.members.filter(m => !m.user.bot).size;
+
+  // Check if there is already an active session for this guild
+  if (sessionManager && sessionManager.hasSession(guildId)) {
+    const existing = sessionManager.getSession(guildId);
+    if (existing.voiceChannelId === channelId) {
+      const result = {
+        connected: true,
+        guild_id: guildId,
+        channel_id: channelId,
+        channel_name: channelName,
+        member_count: memberCount,
+        connection_state: 'already_connected',
+        session_id: existing.sessionId ?? undefined,
+        message: `Bot is already connected to channel "${channelName}" via an active session.`,
+      };
+      console.log(`[MCP] join_voice_channel: already connected guild=${guildId} channel=${channelId}`);
+      return textContent(JSON.stringify(result, null, 2));
+    }
+
+    // Active session in a different channel — cannot join
+    const result = {
+      connected: false,
+      guild_id: guildId,
+      channel_id: channelId,
+      channel_name: channelName,
+      member_count: memberCount,
+      connection_state: 'session_active',
+      message:
+        `An active session is already running in channel "${existing.voiceChannelId}" for this guild. ` +
+        `Stop it with stop_session before joining a different channel.`,
+    };
+    console.log(`[MCP] join_voice_channel: session_active in different channel guild=${guildId}`);
+    return textContent(JSON.stringify(result, null, 2));
+  }
+
+  // No active session — attempt a fresh join for connectivity check
+  const { VoiceConnectionManager } = await import('../voice/connection-manager.js');
+  const manager = new VoiceConnectionManager({ guildId, channelId, guild });
+
+  try {
+    await manager.join();
+
+    const result = {
+      connected: true,
+      guild_id: guildId,
+      channel_id: channelId,
+      channel_name: channelName,
+      member_count: memberCount,
+      connection_state: 'connected',
+      message: `Successfully joined voice channel "${channelName}" (${memberCount} human member(s) present).`,
+    };
+
+    console.log(`[MCP] join_voice_channel: connected guild=${guildId} channel=${channelId}`);
+    return textContent(JSON.stringify(result, null, 2));
+  } catch (error) {
+    const result = {
+      connected: false,
+      guild_id: guildId,
+      channel_id: channelId,
+      channel_name: channelName,
+      member_count: memberCount,
+      connection_state: 'failed',
+      message: `Failed to join voice channel "${channelName}": ${error.message}`,
+    };
+
+    console.error(`[MCP] join_voice_channel: failed guild=${guildId} channel=${channelId}:`, error.message);
+    return textContent(JSON.stringify(result, null, 2));
+  } finally {
+    // Always clean up the temporary connection — this tool is a probe, not a session
+    try {
+      manager.destroy();
+    } catch {
+      // Ignore cleanup errors
+    }
+  }
+}
+
+/**
+ * Leave a Discord voice channel: disconnect the bot, finalize any active
+ * recording session, and trigger meeting minutes generation.
+ *
+ * Behaviour matrix:
+ *   - No Discord client (standalone MCP mode) → errorContent
+ *   - No session and bot not in any voice channel → errorContent
+ *   - Active session exists → cleanupSession (stops STT, saves transcript,
+ *     disconnects voice) + fires minutes generation pipeline
+ *   - Bot connected without a session → raw voice disconnect only
+ *
+ * Returns a session summary including duration, participant count,
+ * transcript count, and minutes generation status.
+ *
+ * @param {object} deps - { client, sessionManager }
+ * @param {string} guildId - Discord guild ID
+ */
+export async function leaveVoiceChannel(deps, guildId) {
+  const { client, sessionManager } = deps;
+
+  if (!client) {
+    return errorContent(
+      'Cannot leave voice channels in standalone MCP mode. ' +
+      'The Discord bot must be running (node src/index.js).'
+    );
+  }
+
+  if (!sessionManager) {
+    return errorContent('Session manager not available.');
+  }
+
+  const hasSession = sessionManager.hasSession(guildId);
+
+  // No active session — check if the bot is physically in a voice channel
+  if (!hasSession) {
+    // Resolve guild to check for bare voice connections
+    const guild = client.guilds.cache.get(guildId);
+    if (!guild) {
+      return errorContent(
+        `Guild ${guildId} not found. The bot may not be a member of this guild.`
+      );
+    }
+
+    // Attempt to destroy any lingering voice connection via @discordjs/voice
+    try {
+      const { getVoiceConnection } = await import('@discordjs/voice');
+      const conn = getVoiceConnection(guildId);
+      if (conn) {
+        conn.destroy();
+        console.log(`[MCP] leave_voice_channel: destroyed bare voice connection guild=${guildId}`);
+        const result = {
+          disconnected: true,
+          guild_id: guildId,
+          had_session: false,
+          minutes_generation: 'not_applicable',
+          message: 'Bot disconnected from voice channel (no active recording session was running).',
+        };
+        return textContent(JSON.stringify(result, null, 2));
+      }
+    } catch {
+      // @discordjs/voice may not be available in all environments — fall through
+    }
+
+    return errorContent(
+      `No active session or voice connection found for guild ${guildId}. ` +
+      'The bot is not currently in a voice channel for this guild.'
+    );
+  }
+
+  // Active session — capture session info before cleanup
+  const session = sessionManager.getSession(guildId);
+
+  try {
+    // Unified teardown: stops audio coordinator (flushes Deepgram buffer,
+    // saves transcript to disk) then disconnects voice channel.
+    const result = await cleanupSession({
+      sessionManager,
+      guildId,
+      reason: 'manual_stop',
+    });
+
+    const response = {
+      disconnected: true,
+      guild_id: guildId,
+      had_session: true,
+      session_id: session?.audioCoordinator?.sessionId ?? undefined,
+      duration_seconds: result.duration,
+      duration_formatted: `${result.durationMinutes}m ${result.durationSeconds}s`,
+      participant_count: result.participantCount,
+      transcript_count: result.transcriptCount,
+      transcript_file: result.transcriptFilePath ?? null,
+      minutes_generation: result.transcriptCount > 0 ? 'pending' : 'skipped',
+      warnings: result.warnings.length > 0 ? result.warnings : undefined,
+      message:
+        result.transcriptCount > 0
+          ? `Session ended. Transcript saved (${result.transcriptCount} entries). ` +
+            'Meeting minutes will be delivered to the text channel within 1-2 minutes.'
+          : 'Session ended. No transcript entries recorded — meeting minutes skipped.',
+    };
+
+    console.log(
+      `[MCP] leave_voice_channel: guild=${guildId} duration=${result.durationMinutes}m${result.durationSeconds}s ` +
+      `participants=${result.participantCount} entries=${result.transcriptCount}`
+    );
+
+    // Fire-and-forget minutes generation (same as stop_session)
+    if (result.transcriptCount > 0 && session) {
+      generateAndDeliverMinutes({
+        transcript: result.transcript,
+        session,
+        transcriptResult: {
+          transcript: result.transcript,
+          filePath: result.transcriptFilePath,
+        },
+        client,
+        reason: 'manual_stop',
+        duration: result.duration,
+      }).then((minutesResult) => {
+        if (minutesResult.success) {
+          console.log(
+            `[MCP] leave_voice_channel minutes generated in ${minutesResult.generationTimeMs}ms: ${minutesResult.filePath}`
+          );
+        } else {
+          console.error(`[MCP] leave_voice_channel minutes generation failed: ${minutesResult.error}`);
+        }
+      }).catch((err) => {
+        console.error('[MCP] leave_voice_channel minutes pipeline error:', err);
+      });
+    }
+
+    return textContent(JSON.stringify(response, null, 2));
+  } catch (error) {
+    console.error('[MCP] leave_voice_channel failed:', error);
+    return errorContent(`Failed to leave voice channel: ${error.message}`);
+  }
 }
 
 /**
@@ -353,50 +618,315 @@ export async function getSession(deps, guildId) {
 }
 
 /**
- * Get transcript for a session.
+ * Get system-wide status of the dicoclerk bot and all active sessions.
+ *
+ * Returns a health snapshot suitable for Openclaw agent consumption:
+ *   - bot_mode: 'connected' (Discord bot running) or 'standalone' (MCP-only)
+ *   - active_session_count: number of active recording sessions
+ *   - sessions: per-guild session summaries with live stats
+ *   - system: version, uptime, Deepgram configuration status
+ *
+ * @param {object} deps - { client, sessionManager }
+ * @param {string} [guildId] - If provided, returns status only for that guild
  */
-export async function getTranscript(deps, guildId, format = 'formatted') {
-  if (!guildId) {
-    return errorContent('guild_id is required to retrieve a transcript.');
+export async function getStatus(deps, guildId) {
+  const { client, sessionManager } = deps;
+  const botMode = client ? 'connected' : 'standalone';
+
+  const sessions = [];
+
+  if (sessionManager && typeof sessionManager.getAllSessions === 'function') {
+    for (const [sid, session] of sessionManager.getAllSessions()) {
+      // Filter by guild if requested
+      if (guildId && sid !== guildId) continue;
+
+      const audioCoordinator = session.audioCoordinator ?? null;
+      const isRecording = audioCoordinator?.isRunning ?? false;
+
+      // Determine Deepgram connection health from coordinator
+      let deepgramStatus = 'unavailable';
+      if (audioCoordinator) {
+        if (audioCoordinator.isRunning) {
+          deepgramStatus = 'active';
+        } else if (audioCoordinator.hasError) {
+          deepgramStatus = 'error';
+        } else {
+          deepgramStatus = 'idle';
+        }
+      }
+
+      const startedAt = session.startedAt ? new Date(session.startedAt) : null;
+      const durationSeconds = startedAt
+        ? Math.round((Date.now() - startedAt.getTime()) / 1000)
+        : 0;
+
+      sessions.push({
+        guild_id: sid,
+        voice_channel_id: session.voiceChannelId ?? null,
+        text_channel_id: session.textChannelId ?? null,
+        language: session.language ?? 'multi',
+        status: session.status ?? 'active',
+        started_at: startedAt?.toISOString() ?? null,
+        duration_seconds: durationSeconds,
+        participant_count: session.participants?.size ?? 0,
+        transcript_count: session.transcript?.length ?? 0,
+        is_recording: isRecording,
+        deepgram_status: deepgramStatus,
+      });
+    }
+  }
+
+  const result = {
+    bot_mode: botMode,
+    active_session_count: sessions.length,
+    sessions,
+    system: {
+      version: '1.0.0',
+      uptime_seconds: Math.round(process.uptime()),
+      deepgram_configured: Boolean(process.env.DEEPGRAM_API_KEY),
+    },
+  };
+
+  if (guildId && sessions.length === 0 && sessionManager) {
+    result.note = `No active session found for guild ${guildId}`;
+  }
+
+  return textContent(JSON.stringify(result, null, 2));
+}
+
+/**
+ * Normalize a raw transcript entry (from AudioSessionCoordinator.#transcript or
+ * a stored JSON file) into the canonical MCP speaker-diarized entry shape.
+ *
+ * The coordinator stores entries with camelCase fields; the MCP API uses snake_case
+ * to be consistent with other JSON-API consumers.
+ *
+ * @param {Object} entry - Raw entry from coordinator or disk
+ * @param {string} sessionId
+ * @returns {Object} MCP-canonical entry
+ */
+function normalizeEntry(entry, sessionId) {
+  // Support both TranscriptSession entry shape (speakerLabel/speakerName/userId/wallClockMs)
+  // and legacy coordinator shape (speaker/speakerName/timestamp)
+  const speakerLabel = entry.speakerLabel ?? entry.speaker ?? 0;
+  const speakerName = entry.speakerName ?? `Speaker ${speakerLabel}`;
+  const userId = entry.userId ?? null;
+  const wallClockMs = entry.wallClockMs ?? entry.timestamp ?? 0;
+
+  return {
+    session_id: entry.sessionId ?? sessionId,
+    speaker_label: speakerLabel,
+    speaker_name: speakerName,
+    user_id: userId,
+    text: entry.text ?? '',
+    start: entry.start ?? 0,
+    end: entry.end ?? 0,
+    duration: entry.duration ?? ((entry.end ?? 0) - (entry.start ?? 0)),
+    confidence: entry.confidence ?? 0,
+    language: entry.language ?? 'unknown',
+    is_final: entry.isFinal ?? true,
+    wall_clock_ms: wallClockMs,
+  };
+}
+
+/**
+ * Build the raw structured JSON response for get_transcript.
+ *
+ * @param {string} sessionId
+ * @param {string} guildId
+ * @param {'live'|'stored'} status
+ * @param {Object[]} rawEntries - Raw transcript entries (from coordinator or disk)
+ * @returns {object} MCP text content response
+ */
+function buildRawResponse(sessionId, guildId, status, rawEntries) {
+  const entries = rawEntries.map(e => normalizeEntry(e, sessionId));
+  const uniqueSpeakers = new Set(entries.map(e => e.speaker_label));
+  const langs = [...new Set(entries.map(e => e.language).filter(l => l !== 'unknown'))];
+
+  const payload = {
+    session_id: sessionId,
+    guild_id: guildId,
+    format: 'raw',
+    status,
+    entry_count: entries.length,
+    speaker_count: uniqueSpeakers.size,
+    language: langs.length === 1 ? langs[0] : langs.join('+') || 'unknown',
+    entries,
+  };
+  return textContent(JSON.stringify(payload, null, 2));
+}
+
+/**
+ * Build the formatted (human-readable) text response for get_transcript.
+ * Reuses normalizeEntry for consistent speaker name resolution across both formats.
+ *
+ * @param {string} sessionId
+ * @param {string} guildId
+ * @param {'live'|'stored'} status
+ * @param {Object[]} rawEntries
+ * @returns {object} MCP text content response
+ */
+function buildFormattedResponse(sessionId, guildId, status, rawEntries) {
+  if (rawEntries.length === 0) {
+    return textContent(`# Transcript — ${sessionId}\nGuild: ${guildId} | Status: ${status}\n\n(No transcript entries yet)`);
+  }
+
+  const lines = rawEntries.map(entry => {
+    // Reuse normalizeEntry for consistent speaker name resolution (handles all legacy shapes)
+    const normalized = normalizeEntry(entry, sessionId);
+    const mm = String(Math.floor(normalized.start / 60)).padStart(2, '0');
+    const ss = String(Math.floor(normalized.start % 60)).padStart(2, '0');
+    return `[${mm}:${ss}] ${normalized.speaker_name}: ${normalized.text}`;
+  });
+
+  const header = [
+    `# Transcript — ${sessionId}`,
+    `Guild: ${guildId} | Status: ${status} | Entries: ${rawEntries.length}`,
+    '',
+  ].join('\n');
+
+  return textContent(header + lines.join('\n'));
+}
+
+/**
+ * Get transcript for a session.
+ *
+ * Lookup order:
+ *  1. If session_id is provided (and not "current"): find the stored JSON file on disk
+ *     matching transcript-{session_id}.json, parse and return.
+ *  2. If guild_id is provided and there is an active session: return live in-memory
+ *     transcript from the AudioSessionCoordinator's TranscriptSession.
+ *  3. Fallback: scan disk for any transcript file matching the guild_id and return
+ *     the most recent one.
+ *
+ * @param {object} deps - { sessionManager }
+ * @param {string} guildId - Discord guild (server) ID
+ * @param {string|undefined} sessionId - Specific session ID, or "current" for active session
+ * @param {'raw'|'formatted'} format - Output format
+ */
+export async function getTranscript(deps, guildId, sessionId, format = 'formatted') {
+  if (!guildId && (!sessionId || sessionId === 'current')) {
+    return errorContent('guild_id is required when session_id is omitted or "current".');
   }
 
   const { sessionManager } = deps;
 
-  // Try live session first
-  if (sessionManager) {
-    const session = sessionManager.getSession(guildId);
-    if (session?.transcript?.length > 0) {
+  // Normalize "current" alias: treat as no session_id
+  const lookupSessionId = (sessionId && sessionId !== 'current') ? sessionId : null;
+
+  // ── Path 1: specific session_id → read from disk ────────────────────────────
+  if (lookupSessionId) {
+    const specificFile = join(TRANSCRIPTS_DIR, `transcript-${lookupSessionId}.json`);
+    try {
+      const raw = await readFile(specificFile, 'utf-8');
+      const data = JSON.parse(raw);
+      const entries = data.transcript ?? [];
+      const storedGuildId = data.guildId ?? guildId;
+
       if (format === 'raw') {
-        return textContent(JSON.stringify({
-          guild_id: guildId,
-          format: 'raw',
-          entry_count: session.transcript.length,
-          entries: session.transcript,
-        }, null, 2));
+        return buildRawResponse(lookupSessionId, storedGuildId, 'stored', entries);
       }
-      // Formatted: speaker-attributed lines
-      const lines = session.transcript.map(entry => {
-        const speaker = entry.speaker ?? entry.userId ?? 'Unknown';
-        const timestamp = entry.timestamp
-          ? new Date(entry.timestamp).toLocaleTimeString()
-          : '';
-        return `[${timestamp}] ${speaker}: ${entry.text}`;
-      });
-      return textContent(lines.join('\n'));
+      return buildFormattedResponse(lookupSessionId, storedGuildId, 'stored', entries);
+    } catch (err) {
+      if (err.code === 'ENOENT') {
+        // Try fallback file
+        const fallbackFile = join(TRANSCRIPTS_DIR, `transcript-${lookupSessionId}-fallback.json`);
+        try {
+          const raw = await readFile(fallbackFile, 'utf-8');
+          const data = JSON.parse(raw);
+          const entries = data.transcript ?? [];
+          const storedGuildId = data.guildId ?? guildId;
+          if (format === 'raw') {
+            return buildRawResponse(lookupSessionId, storedGuildId, 'stored', entries);
+          }
+          return buildFormattedResponse(lookupSessionId, storedGuildId, 'stored', entries);
+        } catch {
+          return errorContent(
+            `No transcript found for session_id "${lookupSessionId}". ` +
+            `Checked: transcript-${lookupSessionId}.json and transcript-${lookupSessionId}-fallback.json`
+          );
+        }
+      }
+      return errorContent(`Failed to read transcript for session "${lookupSessionId}": ${err.message}`);
     }
   }
 
-  // Fall back to disk
+  // ── Path 2: active in-memory session (guild_id, no session_id or session_id="current") ─
+  if (sessionManager) {
+    const session = sessionManager.getSession(guildId);
+    if (session) {
+      // Prefer the rich TranscriptSession from AudioSessionCoordinator (speaker-attributed, deduped)
+      const transcriptSession = session.audioCoordinator?.transcriptSession;
+      if (transcriptSession && transcriptSession.entryCount > 0) {
+        const entries = transcriptSession.toStructuredData();
+        const activeSessionId = session.audioCoordinator?.sessionId ?? `${guildId}-live`;
+        if (format === 'raw') {
+          return buildRawResponse(activeSessionId, guildId, 'live', entries);
+        }
+        return buildFormattedResponse(activeSessionId, guildId, 'live', entries);
+      }
+
+      // Fall back to coordinator's raw transcript array
+      const coordinatorTranscript = session.audioCoordinator?.transcript ?? [];
+      if (coordinatorTranscript.length > 0) {
+        const activeSessionId = session.audioCoordinator?.sessionId ?? `${guildId}-live`;
+        if (format === 'raw') {
+          return buildRawResponse(activeSessionId, guildId, 'live', coordinatorTranscript);
+        }
+        return buildFormattedResponse(activeSessionId, guildId, 'live', coordinatorTranscript);
+      }
+
+      // Session exists but no transcript entries yet
+      const activeSessionId = session.audioCoordinator?.sessionId ?? `${guildId}-live`;
+      if (format === 'raw') {
+        return textContent(JSON.stringify({
+          session_id: activeSessionId,
+          guild_id: guildId,
+          format: 'raw',
+          status: 'live',
+          entry_count: 0,
+          speaker_count: 0,
+          language: 'unknown',
+          entries: [],
+        }, null, 2));
+      }
+      return textContent(
+        `# Transcript — ${activeSessionId}\nGuild: ${guildId} | Status: live\n\n` +
+        `(Session is active but no transcript entries yet — speaking may not have started)`
+      );
+    }
+  }
+
+  // ── Path 3: no active session → scan disk for most recent transcript for guild ─
   try {
     const files = await findTranscriptFiles(guildId);
     if (files.length === 0) {
-      return errorContent(`No transcript found for guild ${guildId}`);
+      return errorContent(
+        `No transcript found for guild ${guildId}. ` +
+        `No active session is running and no stored transcripts exist.`
+      );
     }
-    // Return the most recent
-    const content = await readFile(files[0], 'utf-8');
-    return textContent(content);
+    // Use the most recent file
+    const raw = await readFile(files[0], 'utf-8');
+    let data;
+    try {
+      data = JSON.parse(raw);
+    } catch {
+      // File exists but is not valid JSON — return raw text for formatted, error for raw
+      if (format === 'formatted') return textContent(raw);
+      return errorContent('Most recent transcript file is not valid JSON. Use format="formatted" to read it as plain text.');
+    }
+
+    const entries = data.transcript ?? [];
+    const storedSessionId = data.sessionId ?? `${guildId}-unknown`;
+    const storedGuildId = data.guildId ?? guildId;
+
+    if (format === 'raw') {
+      return buildRawResponse(storedSessionId, storedGuildId, 'stored', entries);
+    }
+    return buildFormattedResponse(storedSessionId, storedGuildId, 'stored', entries);
   } catch (err) {
-    return errorContent(`Failed to read transcript: ${err.message}`);
+    return errorContent(`Failed to retrieve transcript for guild ${guildId}: ${err.message}`);
   }
 }
 
@@ -478,6 +1008,12 @@ export async function getMinutes(deps, guildId, sessionId) {
  * and free-text query.
  */
 export async function searchMinutes(deps, params) {
+  // Semantic validation — throw McpError(InvalidParams) on bad inputs
+  validateDate(params.date_from, 'date_from');
+  validateDate(params.date_to, 'date_to');
+  validatePositiveInt(params.limit, 'limit', { min: 1, max: 100 });
+  validatePositiveInt(params.offset, 'offset', { min: 0, max: undefined });
+
   try {
     const result = await searchEntries({
       query: params.query,
@@ -510,6 +1046,7 @@ export async function searchMinutes(deps, params) {
       showing: result.showing,
     }, null, 2));
   } catch (err) {
+    if (err instanceof McpError) throw err; // re-propagate protocol-level errors
     return errorContent(`Failed to search minutes: ${err.message}`);
   }
 }
@@ -518,6 +1055,7 @@ export async function searchMinutes(deps, params) {
  * List all stored recordings/transcripts.
  */
 export async function listRecordings(deps, limit = 20, guildId) {
+  validatePositiveInt(limit, 'limit', { min: 1, max: 100 });
   const results = [];
 
   // Scan transcripts directory
@@ -600,6 +1138,12 @@ export async function listRecordings(deps, limit = 20, guildId) {
  * @param {boolean} [params.include_content] - Whether to include full content (default true)
  */
 export async function searchMeetingMinutes(deps, params) {
+  // Semantic validation — throw McpError(InvalidParams) on bad inputs
+  validateDate(params.date_from, 'date_from');
+  validateDate(params.date_to, 'date_to');
+  validatePositiveInt(params.limit, 'limit', { min: 1, max: 50 });
+  validatePositiveInt(params.offset, 'offset', { min: 0, max: undefined });
+
   try {
     const result = await searchEntriesWithContent({
       query: params.query,
@@ -636,6 +1180,7 @@ export async function searchMeetingMinutes(deps, params) {
       showing: result.showing,
     }, null, 2));
   } catch (err) {
+    if (err instanceof McpError) throw err;
     return errorContent(`Failed to search meeting minutes: ${err.message}`);
   }
 }
@@ -651,6 +1196,16 @@ export async function searchMeetingMinutes(deps, params) {
  * @param {object} params - Search + summary parameters
  */
 export async function summarizeMinutes(deps, params) {
+  // Semantic validation — throws McpError(-32602) for invalid params.
+  // The MCP SDK converts this to a JSON-RPC error response for the caller.
+  validateDate(params.date_from, 'date_from');
+  validateDate(params.date_to, 'date_to');
+  validatePositiveInt(params.limit, 'limit', { min: 1, max: 20 });
+  validatePositiveInt(params.offset, 'offset', { min: 0, max: undefined });
+  validatePositiveInt(params.max_topics, 'max_topics', { min: 1, max: 20 });
+  validatePositiveInt(params.max_action_items, 'max_action_items', { min: 1, max: 50 });
+  validatePositiveInt(params.max_narrative_length, 'max_narrative_length', { min: 50, max: 2000 });
+
   try {
     // 1. Retrieve matching minutes with content
     const searchResult = await searchEntriesWithContent({
@@ -668,10 +1223,13 @@ export async function summarizeMinutes(deps, params) {
     });
 
     if (searchResult.entries.length === 0) {
+      const emptyResult = { meetingCount: 0, summaries: [], crossMeetingSummary: null, generatedAt: new Date().toISOString() };
       return textContent(JSON.stringify({
         summaries: [],
         meetingCount: 0,
         message: 'No meeting minutes matched the given filters.',
+        agentFormattedText: '# Meeting Minutes Summary (0 meeting(s))\n\nNo records found.',
+        agentDigest: buildAgentDigest(emptyResult),
       }, null, 2));
     }
 
@@ -693,20 +1251,121 @@ export async function summarizeMinutes(deps, params) {
       focusQuery: params.focus_query ?? null,
     });
 
-    // 4. Return both structured JSON and an agent-friendly text rendition
+    // 4. Return structured JSON, a Markdown text rendition, and a compact agent digest
     const agentText = formatSummaryForAgent(summaryResult);
+    const agentDigest = buildAgentDigest(summaryResult, {
+      focusQuery: params.focus_query ?? null,
+      maxActionItems: (params.max_action_items ?? 10) * 2,
+      maxDecisions: 15,
+      maxTopics: (params.max_topics ?? 5) * 2,
+    });
 
     return textContent(JSON.stringify({
       meetingCount: summaryResult.meetingCount,
       generatedAt: summaryResult.generatedAt,
       summaries: summaryResult.summaries,
       crossMeetingSummary: summaryResult.crossMeetingSummary,
-      // Compact text rendition — handy when the consuming agent prefers a
-      // single block of readable text over structured JSON.
+      // Full Markdown rendition — for human-readable display or verbose agent use.
       agentFormattedText: agentText,
+      // Compact, token-efficient digest — preferred for Openclaw agent context windows.
+      agentDigest,
     }, null, 2));
   } catch (err) {
+    if (err instanceof McpError) throw err;
     return errorContent(`Failed to summarize minutes: ${err.message}`);
+  }
+}
+
+/**
+ * Retrieve stored meeting minutes as fully structured data.
+ *
+ * Accepts query parameters to filter by session ID, date range, guild,
+ * channel, participant, and keywords.  Returns each matching minutes file
+ * parsed into structured JSON — not raw markdown — making it suitable for
+ * programmatic consumption by agents or APIs.
+ *
+ * Returned structure per result:
+ *   - Meeting metadata (session_id, date, time, duration, guild, channel,
+ *     participants, language, started_by, filename)
+ *   - structured_content:
+ *       summary            – text of the summary/overview section
+ *       key_discussion_points – array of discussion topic strings
+ *       action_items       – array of { task, assignee, deadline }
+ *       decisions          – array of decision strings
+ *       attendees          – array of { name, role, utterance_count }
+ *       statistics         – utterance count, section count, duration, etc.
+ *       transcript         – (optional) array of { timestamp, speaker, text }
+ *   - raw_markdown         – (optional) full markdown source
+ *
+ * @param {object} deps - App dependencies (not used; reads from disk/index)
+ * @param {object} params - Query parameters
+ * @param {string} [params.session_id]   - Retrieve a specific session by ID
+ * @param {string} [params.query]        - Free-text search across metadata/content
+ * @param {string} [params.guild_id]     - Filter by Discord guild ID
+ * @param {string} [params.channel_name] - Partial match on channel name
+ * @param {string} [params.participant]  - Partial match on participant name
+ * @param {string} [params.date_from]    - Start date (YYYY-MM-DD, inclusive)
+ * @param {string} [params.date_to]      - End date (YYYY-MM-DD, inclusive)
+ * @param {string[]} [params.keywords]   - Keywords to search in content
+ * @param {string} [params.language]     - Language code filter (ko/en)
+ * @param {number} [params.limit]        - Max results (default 5)
+ * @param {number} [params.offset]       - Pagination offset (default 0)
+ * @param {boolean} [params.include_transcript]   - Include transcript entries (default false)
+ * @param {boolean} [params.include_raw_markdown] - Include raw markdown (default false)
+ */
+export async function getPreviousMinutes(deps, params) {
+  try {
+    // If a specific session_id is provided, try direct index lookup first
+    if (params.session_id) {
+      const entry = await getEntryBySessionId(params.session_id);
+      if (entry) {
+        try {
+          const content = await readFile(entry.filePath, 'utf-8');
+          const structured = parseMinutesToStructuredData(entry, content, {
+            includeTranscript: params.include_transcript ?? false,
+            includeRawMarkdown: params.include_raw_markdown ?? false,
+          });
+          return textContent(JSON.stringify({
+            results: [structured],
+            total: 1,
+            showing: 1,
+          }, null, 2));
+        } catch {
+          return errorContent(`Minutes file for session ${params.session_id} not found on disk.`);
+        }
+      }
+      return errorContent(`No minutes found for session_id: ${params.session_id}`);
+    }
+
+    // General search using the index
+    const result = await searchEntriesWithContent({
+      query: params.query,
+      guildId: params.guild_id,
+      channelName: params.channel_name,
+      participant: params.participant,
+      dateFrom: params.date_from,
+      dateTo: params.date_to,
+      keywords: params.keywords,
+      language: params.language,
+      limit: params.limit ?? 5,
+      offset: params.offset ?? 0,
+      includeContent: true,
+    });
+
+    const structured = result.entries
+      .filter(e => e.content)
+      .map(e => parseMinutesToStructuredData(e, e.content, {
+        includeTranscript: params.include_transcript ?? false,
+        includeRawMarkdown: params.include_raw_markdown ?? false,
+      }));
+
+    return textContent(JSON.stringify({
+      results: structured,
+      total: result.total,
+      showing: structured.length,
+    }, null, 2));
+  } catch (err) {
+    return errorContent(`Failed to retrieve previous minutes: ${err.message}`);
   }
 }
 

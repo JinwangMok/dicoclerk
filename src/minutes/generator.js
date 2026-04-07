@@ -5,17 +5,25 @@
  * 1. Receives transcript + session metadata
  * 2. Formats structured meeting minutes (Markdown)
  * 3. Saves the minutes file to disk
- * 4. Sends the file to the Discord text channel
+ * 4. Sends the file to the Discord text channel (with retry + fallback)
  *
  * Designed to complete within 1~2 minutes of session end.
  * Runs as a fire-and-forget async pipeline — errors are logged
  * and reported to the text channel, never thrown to the caller.
+ *
+ * Sub-AC 5.4: Discord file delivery
+ * - Retry up to MAX_DELIVERY_ATTEMPTS times with exponential backoff
+ * - Fallback to text-only notification when file attachment fails
+ * - pipeline success = file saved to disk (delivery errors are non-fatal)
+ * - deliverySuccess / deliveryError fields communicate delivery outcome
  */
 
 import { writeFile, mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { formatMeetingMinutes, generateMinutesFilename } from './formatter.js';
+import { processWithLLM } from './llm-processor.js';
 import { addEntry as addIndexEntry } from './index-store.js';
+import { aggregateSessionData, toFormatterMetadata } from './aggregator.js';
 import { AttachmentBuilder } from 'discord.js';
 
 /** Directory for storing generated minutes */
@@ -24,6 +32,24 @@ const MINUTES_DIR = join(DATA_DIR, 'minutes');
 
 /** SLA timeout for the full minutes generation pipeline (2 minutes) */
 const GENERATION_TIMEOUT_MS = 2 * 60 * 1000;
+
+/** Maximum number of Discord delivery retry attempts */
+const MAX_DELIVERY_ATTEMPTS = 3;
+
+/**
+ * Base delay (ms) for exponential backoff between delivery retries.
+ * Attempts: 1st retry after 2s, 2nd retry after 4s.
+ * Override via _DELIVERY_RETRY_DELAY_MS for testing.
+ */
+let _DELIVERY_RETRY_DELAY_MS = 2000;
+
+/**
+ * Override the delivery retry base delay. Intended for tests only.
+ * @param {number} ms
+ */
+export function _setDeliveryRetryDelayMs(ms) {
+  _DELIVERY_RETRY_DELAY_MS = ms;
+}
 
 /**
  * @typedef {Object} GeneratorInput
@@ -37,10 +63,12 @@ const GENERATION_TIMEOUT_MS = 2 * 60 * 1000;
 
 /**
  * @typedef {Object} GeneratorResult
- * @property {boolean} success
+ * @property {boolean} success             - true if the minutes file was saved to disk
  * @property {string|null} filePath        - Path to saved minutes file on disk
- * @property {string|null} error           - Error message if failed
- * @property {number} generationTimeMs     - How long generation took
+ * @property {string|null} error           - Error message if pipeline failed (not delivery)
+ * @property {boolean} deliverySuccess     - true if file was delivered to Discord channel
+ * @property {string|null} deliveryError   - Error message if Discord delivery failed
+ * @property {number} generationTimeMs     - How long the pipeline took end-to-end
  */
 
 /**
@@ -55,7 +83,7 @@ const GENERATION_TIMEOUT_MS = 2 * 60 * 1000;
  */
 export async function generateAndDeliverMinutes(input) {
   const startTime = Date.now();
-  const { transcript, session, transcriptResult, client, reason, duration } = input;
+  const { session, client } = input;
 
   // Resolve the text channel for sending the minutes
   const guild = client?.guilds?.cache?.get(session.guildId);
@@ -94,19 +122,35 @@ export async function generateAndDeliverMinutes(input) {
       success: false,
       filePath: null,
       error: error.message,
+      deliverySuccess: false,
+      deliveryError: null,
       generationTimeMs,
     };
   }
 }
 
 async function _runPipeline(input, startTime, guild, textChannel) {
-  const { transcript, session, transcriptResult, duration } = input;
+  const { transcript, session, transcriptResult, duration, reason } = input;
 
-  // --- Step 1: Build metadata for the formatter ---
-  const metadata = buildMetadata(session, transcriptResult, guild, duration);
+  // --- Step 1: Aggregate all session data into a single structured object ---
+  const minutesData = aggregateSessionData({
+    session,
+    coordinatorResult: {
+      transcript: transcriptResult?.transcript ?? transcript ?? null,
+      filePath: transcriptResult?.filePath ?? null,
+      speakerMap: transcriptResult?.speakerMap ?? null,
+    },
+    speakerMap: transcriptResult?.speakerMap ?? null,
+    guild,
+    durationSeconds: duration,
+    reason: reason ?? 'unknown',
+  });
 
-  // Use transcript from coordinator result if available, otherwise session transcript
-  const transcriptEntries = transcriptResult?.transcript ?? transcript ?? session.transcript ?? [];
+  // --- Step 1b: Derive legacy metadata shape for the formatter ---
+  const metadata = toFormatterMetadata(minutesData);
+
+  // Use the normalised, chronologically-sorted transcript from the aggregator
+  const transcriptEntries = minutesData.transcript;
 
   if (transcriptEntries.length === 0) {
     const msg = 'No transcript entries recorded. Skipping minutes generation.';
@@ -120,13 +164,24 @@ async function _runPipeline(input, startTime, guild, textChannel) {
       success: true,
       filePath: null,
       error: null,
+      deliverySuccess: false,
+      deliveryError: null,
       generationTimeMs: Date.now() - startTime,
     };
   }
 
-  // --- Step 2: Format the meeting minutes ---
+  // --- Step 2: AI-enhanced content generation (optional, graceful fallback) ---
+  console.log(`[MinutesGenerator] Requesting AI-generated content for ${transcriptEntries.length} entries…`);
+  const aiContent = await processWithLLM(transcriptEntries, metadata);
+  if (aiContent) {
+    console.log(`[MinutesGenerator] AI content received from ${aiContent.provider}`);
+  } else {
+    console.log('[MinutesGenerator] Using heuristic extraction (no AI content available)');
+  }
+
+  // --- Step 3: Format the meeting minutes (with AI content injected when available) ---
   console.log(`[MinutesGenerator] Formatting minutes for ${transcriptEntries.length} entries...`);
-  const markdown = formatMeetingMinutes(transcriptEntries, metadata);
+  const markdown = formatMeetingMinutes(transcriptEntries, metadata, {}, aiContent);
 
   // --- Step 3: Save to disk ---
   await mkdir(MINUTES_DIR, { recursive: true });
@@ -138,46 +193,162 @@ async function _runPipeline(input, startTime, guild, textChannel) {
 
   // --- Step 3b: Update the minutes index ---
   try {
-    const participantNames = metadata.speakerMap
-      ? [...metadata.speakerMap.values()]
-      : [];
+    const participantNames = minutesData.speakers.length > 0
+      ? minutesData.speakers.map(s => s.displayName)
+      : [...metadata.speakerMap.values()];
 
     await addIndexEntry({
+      sessionId: minutesData.sessionId,
       filename,
       filePath,
-      startedAt: metadata.startedAt,
-      durationSeconds: metadata.durationSeconds,
-      guildId: session.guildId ?? '',
-      guildName: metadata.guildName,
-      channelId: session.voiceChannelId ?? '',
-      channelName: metadata.channelName,
+      startedAt: minutesData.startedAt,
+      durationSeconds: minutesData.durationSeconds,
+      guildId: minutesData.guildId,
+      guildName: minutesData.guildName,
+      channelId: minutesData.channelId,
+      channelName: minutesData.channelName,
       participants: participantNames,
-      transcriptCount: transcriptEntries.length,
-      language: metadata.language,
-      startedBy: metadata.startedBy,
+      transcriptCount: minutesData.transcriptCount,
+      language: minutesData.language,
+      startedBy: minutesData.startedBy,
     });
   } catch (indexErr) {
     console.warn('[MinutesGenerator] Failed to update minutes index:', indexErr.message);
     // Non-fatal: minutes file is already saved
   }
 
-  // --- Step 4: Send to Discord text channel ---
+  // --- Step 4: Send to Discord text channel (with retry + fallback) ---
+  let deliverySuccess = false;
+  let deliveryError = null;
+
   if (textChannel) {
-    await sendMinutesToChannel(textChannel, markdown, filename, metadata, transcriptEntries.length);
+    try {
+      await _deliverWithRetry(textChannel, markdown, filename, metadata, transcriptEntries.length);
+      deliverySuccess = true;
+    } catch (sendError) {
+      deliveryError = sendError.message;
+      console.error(
+        `[MinutesGenerator] Discord delivery failed after ${MAX_DELIVERY_ATTEMPTS} attempts: ${sendError.message}`
+      );
+
+      // Fallback: send a text-only notification so the user knows the file is on disk
+      await _sendDeliveryFailureNotification(textChannel, filename, sendError.message, metadata.language);
+    }
   } else {
-    console.warn(`[MinutesGenerator] Text channel ${session.textChannelId} not found, skipping Discord delivery`);
+    console.warn(
+      `[MinutesGenerator] Text channel ${session.textChannelId} not found, skipping Discord delivery`
+    );
   }
 
   const generationTimeMs = Date.now() - startTime;
-  console.log(`[MinutesGenerator] Pipeline complete in ${generationTimeMs}ms`);
+  console.log(
+    `[MinutesGenerator] Pipeline complete in ${generationTimeMs}ms` +
+    ` (delivery: ${deliverySuccess ? 'ok' : 'failed'})`
+  );
 
   return {
     success: true,
     filePath,
     error: null,
+    deliverySuccess,
+    deliveryError,
     generationTimeMs,
   };
 }
+
+// ---------------------------------------------------------------------------
+// Delivery helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Attempt to deliver the minutes file to the channel up to MAX_DELIVERY_ATTEMPTS
+ * times, using exponential backoff between retries.
+ *
+ * @param {import('discord.js').TextChannel} channel
+ * @param {string} markdown
+ * @param {string} filename
+ * @param {Object} metadata
+ * @param {number} entryCount
+ * @returns {Promise<void>} Resolves on success, throws after all attempts fail
+ */
+async function _deliverWithRetry(channel, markdown, filename, metadata, entryCount) {
+  let lastError;
+
+  for (let attempt = 1; attempt <= MAX_DELIVERY_ATTEMPTS; attempt++) {
+    try {
+      await sendMinutesToChannel(channel, markdown, filename, metadata, entryCount);
+      console.log(
+        `[MinutesGenerator] Minutes delivered to channel ${channel.id}` +
+        (attempt > 1 ? ` (attempt ${attempt})` : '')
+      );
+      return; // success
+    } catch (err) {
+      lastError = err;
+      console.warn(
+        `[MinutesGenerator] Delivery attempt ${attempt}/${MAX_DELIVERY_ATTEMPTS} failed: ${err.message}`
+      );
+
+      if (attempt < MAX_DELIVERY_ATTEMPTS) {
+        const delay = _DELIVERY_RETRY_DELAY_MS * Math.pow(2, attempt - 1);
+        console.log(`[MinutesGenerator] Retrying delivery in ${delay}ms...`);
+        await _sleep(delay);
+      }
+    }
+  }
+
+  throw lastError;
+}
+
+/**
+ * Send a fallback text-only notification when file delivery has failed.
+ * The message tells users the minutes are saved on disk and why delivery failed.
+ *
+ * @param {import('discord.js').TextChannel} channel
+ * @param {string} filename
+ * @param {string} errorMessage
+ * @param {string} language - 'en' | 'ko'
+ */
+async function _sendDeliveryFailureNotification(channel, filename, errorMessage, language) {
+  const isKo = language === 'ko';
+
+  const lines = isKo
+    ? [
+        '⚠️ **회의록 파일 전송 실패**',
+        `오류: ${errorMessage}`,
+        `회의록은 디스크에 저장되었습니다: \`${filename}\``,
+        '파일을 직접 확인하거나 나중에 다시 시도해 주세요.',
+      ]
+    : [
+        '⚠️ **Meeting minutes delivery failed**',
+        `Error: ${errorMessage}`,
+        `The minutes file has been saved to disk: \`${filename}\``,
+        'Please retrieve the file manually or try again later.',
+      ];
+
+  try {
+    await channel.send({ content: lines.join('\n') });
+    console.log('[MinutesGenerator] Delivery failure notification sent to channel');
+  } catch (notifyError) {
+    // Notification also failed — log only, never throw
+    console.error(
+      '[MinutesGenerator] Failed to send delivery failure notification:',
+      notifyError.message
+    );
+  }
+}
+
+/**
+ * Promisified sleep helper. Extracted so tests can override _DELIVERY_RETRY_DELAY_MS
+ * to 0 and avoid waiting during retries.
+ * @param {number} ms
+ */
+function _sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// ---------------------------------------------------------------------------
+// Public helpers (also used directly in tests)
+// ---------------------------------------------------------------------------
 
 /**
  * Build SessionMetadata from session info and guild data.
@@ -199,7 +370,6 @@ function buildMetadata(session, transcriptResult, guild, durationSeconds) {
   // Build speaker map from coordinator's speaker map or participants
   const speakerMap = new Map();
   if (transcriptResult?.speakerMap) {
-    // speakerMap from coordinator is a Map<number, string> or plain object
     const srcMap = transcriptResult.speakerMap;
     if (srcMap instanceof Map) {
       for (const [k, v] of srcMap) speakerMap.set(k, v);
@@ -275,8 +445,6 @@ async function sendMinutesToChannel(channel, markdown, filename, metadata, entry
     content: summaryLines.join('\n'),
     files: [attachment],
   });
-
-  console.log(`[MinutesGenerator] Minutes delivered to channel ${channel.id}`);
 }
 
 /**
@@ -297,4 +465,5 @@ export {
   sendMinutesToChannel,
   formatDurationSimple,
   MINUTES_DIR,
+  MAX_DELIVERY_ATTEMPTS,
 };

@@ -17,7 +17,9 @@ import { join } from 'node:path';
 import { DeepgramStreamingClient } from '../stt/deepgram-client.js';
 import { DeepgramConnectionPool } from '../stt/connection-pool.js';
 import { AudioCapturePipeline } from './audio-capture-pipeline.js';
+import { OpusDecoderPool } from './opus-decoder.js';
 import { SpeakerIdentifier } from '../stt/speaker-identifier.js';
+import { TranscriptSession } from '../stt/transcript-store.js';
 
 /** Directory for storing transcripts and recordings */
 const DATA_DIR = join(process.cwd(), 'data');
@@ -89,8 +91,23 @@ export class AudioSessionCoordinator extends EventEmitter {
   /** @type {number} dropped audio packets during Deepgram outage */
   #droppedPackets = 0;
 
+  /**
+   * Per-user Opus→linear16 decoder pool.
+   * Created during start() and destroyed during stop().
+   * @type {OpusDecoderPool|null}
+   */
+  #opusDecoder = null;
+
   /** @type {TranscriptEntry[]} buffered entries saved during fallback */
   #fallbackBuffer = [];
+
+  /**
+   * Per-session in-memory transcript store.
+   * Accumulates speaker-attributed, deduplicated transcript segments.
+   * Created in start(), closed/returned in stop().
+   * @type {TranscriptSession|null}
+   */
+  #transcriptSession = null;
 
   /**
    * @param {Object} options
@@ -99,14 +116,32 @@ export class AudioSessionCoordinator extends EventEmitter {
    * @param {string} [options.sessionId] - Unique session identifier
    * @param {boolean} [options.usePool=false] - Use connection pool for multi-speaker support
    * @param {Object} [options.poolConfig] - Connection pool configuration overrides
+   * @param {Function} [options.deepgramClientFactory] - Optional factory for creating DeepgramStreamingClient
+   *   (used for testing/DI; signature: (options) => DeepgramStreamingClient)
+   * @param {Function} [options.pipelineFactory] - Optional factory for creating AudioCapturePipeline
+   *   (used for testing/DI; signature: (options) => AudioCapturePipeline)
+   * @param {Function} [options.opusDecoderFactory] - Optional factory for creating OpusDecoderPool
+   *   (used for testing/DI; signature: () => OpusDecoderPool)
    */
-  constructor({ guildId, language, sessionId, usePool = false, poolConfig = {} }) {
+  constructor({
+    guildId,
+    language,
+    sessionId,
+    usePool = false,
+    poolConfig = {},
+    deepgramClientFactory = null,
+    pipelineFactory = null,
+    opusDecoderFactory = null,
+  }) {
     super();
     this.#guildId = guildId;
     this.#language = language;
     this.#sessionId = sessionId || `${guildId}-${Date.now()}`;
     this.#usePool = usePool;
     this._poolConfig = poolConfig;
+    this._deepgramClientFactory = deepgramClientFactory;
+    this._pipelineFactory = pipelineFactory;
+    this._opusDecoderFactory = opusDecoderFactory;
   }
 
   /** Whether the coordinator is actively capturing */
@@ -150,6 +185,16 @@ export class AudioSessionCoordinator extends EventEmitter {
   }
 
   /**
+   * The per-session in-memory transcript store.
+   * Provides speaker-attributed, structured transcript data for minutes generation.
+   * Available after start() is called; contains final session data after stop().
+   * @returns {TranscriptSession|null}
+   */
+  get transcriptSession() {
+    return this.#transcriptSession;
+  }
+
+  /**
    * Start audio capture: connect Deepgram, create pipeline, begin forwarding.
    *
    * Supports two modes:
@@ -170,6 +215,10 @@ export class AudioSessionCoordinator extends EventEmitter {
 
     // Ensure data directories exist
     await mkdir(TRANSCRIPTS_DIR, { recursive: true });
+
+    // Create the per-session in-memory transcript store.
+    // Resets if start() is somehow called again on the same coordinator instance.
+    this.#transcriptSession = new TranscriptSession({ sessionId: this.#sessionId });
 
     // Build Deepgram live options based on language
     const liveOptions = this.#buildLiveOptions();
@@ -209,11 +258,20 @@ export class AudioSessionCoordinator extends EventEmitter {
    * @returns {Promise<void>}
    */
   async #startWithSingleClient(connection, resolveUsername, liveOptions) {
-    // Create Deepgram client
-    this.#deepgramClient = new DeepgramStreamingClient({
-      apiKey: process.env.DEEPGRAM_API_KEY,
-      liveOptions,
-    });
+    // Create Deepgram client — use injected factory if provided (enables testing/DI)
+    if (this._deepgramClientFactory) {
+      this.#deepgramClient = this._deepgramClientFactory({
+        apiKey: process.env.DEEPGRAM_API_KEY,
+        sessionId: this.#sessionId,
+        liveOptions,
+      });
+    } else {
+      this.#deepgramClient = new DeepgramStreamingClient({
+        apiKey: process.env.DEEPGRAM_API_KEY,
+        sessionId: this.#sessionId,
+        liveOptions,
+      });
+    }
 
     this.#wireDeepgramEvents();
 
@@ -222,17 +280,31 @@ export class AudioSessionCoordinator extends EventEmitter {
       await this.#deepgramClient.connect();
       console.log(`[AudioCoordinator] Deepgram connected for session=${this.#sessionId}`);
     } catch (err) {
-      this.emit('error', new Error(`Failed to connect to Deepgram: ${err.message}`));
-      throw err;
+      const wrappedErr = new Error(`Failed to connect to Deepgram: ${err.message}`);
+      this.emit('error', wrappedErr);
+      throw wrappedErr;
     }
 
+    // Create per-user Opus→linear16 decoder pool — use injected factory if provided
+    this.#opusDecoder = this._opusDecoderFactory
+      ? this._opusDecoderFactory()
+      : new OpusDecoderPool();
+    this.#opusDecoder.on('decode_error', ({ userId, error }) => {
+      this.emit('warning', `Opus decode error for user ${userId}: ${error}`);
+    });
+
     // Create audio capture pipeline with speaker identifier for user attribution
-    this.#pipeline = new AudioCapturePipeline({
+    // Use injected factory if provided (enables testing/DI)
+    const pipelineOptions = {
       connection,
       deepgramClient: this.#deepgramClient,
       resolveUsername: resolveUsername || undefined,
       speakerIdentifier: this.#speakerIdentifier,
-    });
+      opusDecoder: this.#opusDecoder,
+    };
+    this.#pipeline = this._pipelineFactory
+      ? this._pipelineFactory(pipelineOptions)
+      : new AudioCapturePipeline(pipelineOptions);
 
     this.#wirePipelineEvents();
     this.#speakerIdentifier.startEviction();
@@ -273,11 +345,18 @@ export class AudioSessionCoordinator extends EventEmitter {
     // We create a thin adapter that implements the DeepgramStreamingClient interface.
     const poolProxy = this.#createPoolProxy();
 
+    // Create per-user Opus→linear16 decoder pool (shared across pool connections)
+    this.#opusDecoder = new OpusDecoderPool();
+    this.#opusDecoder.on('decode_error', ({ userId, error }) => {
+      this.emit('warning', `Opus decode error for user ${userId}: ${error}`);
+    });
+
     this.#pipeline = new AudioCapturePipeline({
       connection,
       deepgramClient: poolProxy,
       resolveUsername: resolveUsername || undefined,
       speakerIdentifier: this.#speakerIdentifier,
+      opusDecoder: this.#opusDecoder,
     });
 
     this.#wirePipelineEvents();
@@ -330,11 +409,11 @@ export class AudioSessionCoordinator extends EventEmitter {
 
   /**
    * Stop audio capture, flush Deepgram, save transcript to disk.
-   * @returns {Promise<{ transcript: TranscriptEntry[], filePath: string }>}
+   * @returns {Promise<{ transcript: TranscriptEntry[], filePath: string, transcriptSession: TranscriptSession|null }>}
    */
   async stop() {
     if (!this.#running) {
-      return { transcript: this.#transcript, filePath: null };
+      return { transcript: this.#transcript, filePath: null, transcriptSession: this.#transcriptSession };
     }
 
     this.#running = false;
@@ -350,6 +429,12 @@ export class AudioSessionCoordinator extends EventEmitter {
       this.#pipeline.stop();
       this.#pipeline.removeAllListeners();
       this.#pipeline = null;
+    }
+
+    // Destroy Opus decoder pool — releases per-user WASM decoder instances
+    if (this.#opusDecoder) {
+      this.#opusDecoder.destroy();
+      this.#opusDecoder = null;
     }
 
     // Disconnect Deepgram (closes WebSocket gracefully)
@@ -379,7 +464,7 @@ export class AudioSessionCoordinator extends EventEmitter {
       `[AudioCoordinator] Stopped session=${this.#sessionId} entries=${this.#transcript.length} dropped=${this.#droppedPackets}`
     );
 
-    return { transcript: this.#transcript, filePath };
+    return { transcript: this.#transcript, filePath, transcriptSession: this.#transcriptSession };
   }
 
   /**
@@ -392,12 +477,13 @@ export class AudioSessionCoordinator extends EventEmitter {
       smart_format: true,
       punctuate: true,
       diarize: true,
+      diarize_max_speakers: 10,  // Support up to 10 concurrent Discord participants
       interim_results: true,
       utterance_end_ms: 1500,
       vad_events: true,
-      encoding: 'opus',
+      encoding: 'linear16',  // Decoded mono PCM from OpusDecoderPool
       sample_rate: 48000,
-      channels: 1,
+      channels: 1,           // Mono after stereo→mono mix in decoder
     };
 
     switch (this.#language) {
@@ -465,6 +551,17 @@ export class AudioSessionCoordinator extends EventEmitter {
           this.#userSpeakerMap.set(identification.userId, event.speaker);
         }
 
+        // Register speaker in the TranscriptSession so that the structured
+        // store has Discord user identity linked to the Deepgram speaker label.
+        // Unresolved speakers fall back to "Speaker N" inside TranscriptSession.
+        if (this.#transcriptSession && identification.userId) {
+          this.#transcriptSession.registerSpeaker(
+            event.speaker,
+            identification.userId,
+            speakerName,
+          );
+        }
+
         const entry = {
           speaker: event.speaker,
           speakerName,
@@ -478,6 +575,10 @@ export class AudioSessionCoordinator extends EventEmitter {
         };
 
         this.#transcript.push(entry);
+
+        // Accumulate in the structured per-session store (dedup already done by DG client)
+        this.#transcriptSession?.addFromEvent(event);
+
         this.emit('transcript', entry);
       } else if (!event.isFinal && event.text.trim()) {
         this.emit('transcript_interim', {
@@ -519,6 +620,15 @@ export class AudioSessionCoordinator extends EventEmitter {
           this.#userSpeakerMap.set(identification.userId, event.speaker);
         }
 
+        // Register speaker in the TranscriptSession (pool mode)
+        if (this.#transcriptSession && identification.userId) {
+          this.#transcriptSession.registerSpeaker(
+            event.speaker,
+            identification.userId,
+            speakerName,
+          );
+        }
+
         const entry = {
           speaker: event.speaker,
           speakerName,
@@ -533,6 +643,10 @@ export class AudioSessionCoordinator extends EventEmitter {
         };
 
         this.#transcript.push(entry);
+
+        // Accumulate in the structured per-session store (pool mode)
+        this.#transcriptSession?.addFromEvent(event);
+
         this.emit('transcript', entry);
       } else if (!event.isFinal && event.text?.trim()) {
         this.emit('transcript_interim', {
@@ -635,6 +749,8 @@ export class AudioSessionCoordinator extends EventEmitter {
    * Resolve speaker names in the transcript using the SpeakerIdentifier.
    * Performs a final pass over all transcript entries, updating any entries
    * that still have generic "Speaker N" names using the latest mappings.
+   * Also synchronises resolved speaker identities into the TranscriptSession
+   * so that toStructuredData() / toPlainText() exports have correct names.
    */
   #resolveAllSpeakerNames() {
     // Populate the speaker identifier with any known users from the pipeline
@@ -656,6 +772,18 @@ export class AudioSessionCoordinator extends EventEmitter {
         // Also update legacy speaker map
         this.#speakerMap.set(entry.speaker, mapping.displayName);
         this.#userSpeakerMap.set(mapping.userId, entry.speaker);
+      }
+    }
+
+    // Sync all resolved speaker mappings into the TranscriptSession so that
+    // its export methods (toStructuredData, toPlainText, getSummary) reflect
+    // the fully-resolved speaker identities after the final pass.
+    if (this.#transcriptSession) {
+      for (const [speakerLabel, displayName] of this.#speakerMap) {
+        // Find the Discord userId for this speaker label
+        const userId = [...this.#userSpeakerMap.entries()]
+          .find(([, label]) => label === speakerLabel)?.[0] ?? null;
+        this.#transcriptSession.registerSpeaker(speakerLabel, userId, displayName);
       }
     }
   }

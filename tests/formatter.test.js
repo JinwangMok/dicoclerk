@@ -7,6 +7,7 @@ import assert from 'node:assert/strict';
 
 import {
   formatMeetingMinutes,
+  renderMinutesFromSession,
   generateMinutesFilename,
   formatDuration,
   formatTimestamp,
@@ -878,6 +879,64 @@ describe('formatMeetingMinutes', () => {
     assert.ok(output.includes('Unknown Server'));
     assert.ok(output.includes('Unknown Channel'));
   });
+
+  it('follows template order: date/participants → full transcript → summary → decisions → action items', () => {
+    const transcript = makeSampleTranscript();
+    const metadata = makeMetadata();
+    const output = formatMeetingMinutes(transcript, metadata);
+
+    // Find index of each required section heading
+    const idxDate = output.indexOf('날짜');
+    const idxParticipants = output.indexOf('## 참석자');
+    const idxTranscript = output.indexOf('## 전체 녹취록');
+    const idxSummary = output.indexOf('## 요약');
+    const idxDecisions = output.indexOf('## 결정 사항');
+    const idxActionItems = output.indexOf('## 액션 아이템');
+
+    // All sections must be present
+    assert.ok(idxDate >= 0, 'Missing date field');
+    assert.ok(idxParticipants >= 0, 'Missing participants section');
+    assert.ok(idxTranscript >= 0, 'Missing full transcript section');
+    assert.ok(idxSummary >= 0, 'Missing summary section');
+    assert.ok(idxDecisions >= 0, 'Missing decisions section');
+    assert.ok(idxActionItems >= 0, 'Missing action items section');
+
+    // Enforce template order
+    assert.ok(idxDate < idxParticipants, 'Date must appear before participants');
+    assert.ok(idxParticipants < idxTranscript, 'Participants must appear before full transcript');
+    assert.ok(idxTranscript < idxSummary, 'Full transcript must appear before summary');
+    assert.ok(idxSummary < idxDecisions, 'Summary must appear before decisions');
+    assert.ok(idxDecisions < idxActionItems, 'Decisions must appear before action items');
+  });
+
+  it('follows English template order: date/participants → full transcript → summary → decisions → action items', () => {
+    const transcript = [
+      makeEntry({ text: 'We decided to use the new framework', speaker: 0, start: 5 }),
+      makeEntry({ text: "I'll handle the deployment by tomorrow", speaker: 1, start: 10 }),
+    ];
+    const metadata = makeMetadata({ language: 'en', speakerMap: new Map([[0, 'Alice'], [1, 'Bob']]) });
+    const output = formatMeetingMinutes(transcript, metadata);
+
+    const idxDate = output.indexOf('Date');
+    const idxParticipants = output.indexOf('## Attendees');
+    const idxTranscript = output.indexOf('## Full Transcript');
+    const idxSummary = output.indexOf('## Summary');
+    const idxDecisions = output.indexOf('## Decisions');
+    const idxActionItems = output.indexOf('## Action Items');
+
+    assert.ok(idxDate >= 0, 'Missing Date field');
+    assert.ok(idxParticipants >= 0, 'Missing Attendees section');
+    assert.ok(idxTranscript >= 0, 'Missing Full Transcript section');
+    assert.ok(idxSummary >= 0, 'Missing Summary section');
+    assert.ok(idxDecisions >= 0, 'Missing Decisions section');
+    assert.ok(idxActionItems >= 0, 'Missing Action Items section');
+
+    assert.ok(idxDate < idxParticipants, 'Date must appear before Attendees');
+    assert.ok(idxParticipants < idxTranscript, 'Attendees must appear before Full Transcript');
+    assert.ok(idxTranscript < idxSummary, 'Full Transcript must appear before Summary');
+    assert.ok(idxSummary < idxDecisions, 'Summary must appear before Decisions');
+    assert.ok(idxDecisions < idxActionItems, 'Decisions must appear before Action Items');
+  });
 });
 
 describe('generateMinutesFilename', () => {
@@ -902,5 +961,170 @@ describe('generateMinutesFilename', () => {
     assert.ok(filename.startsWith('minutes_'));
     assert.ok(filename.includes('meeting'));
     assert.ok(filename.endsWith('.md'));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// renderMinutesFromSession — structured session data entry point
+// ---------------------------------------------------------------------------
+
+/**
+ * Build a minimal SessionMinutesData-shaped object for testing.
+ * Mirrors the shape produced by aggregator.js aggregateSessionData().
+ */
+function makeSessionData(overrides = {}) {
+  return {
+    sessionId: 'test-session-001',
+    guildId: '111',
+    guildName: 'Test Server',
+    channelId: '222',
+    channelName: 'general-voice',
+    textChannelId: '333',
+    language: 'ko',
+    startedBy: 'TestUser',
+    startedAt: new Date('2026-04-03T10:00:00Z'),
+    endedAt: new Date('2026-04-03T10:10:00Z'),
+    durationSeconds: 600,
+    reason: 'manual_stop',
+    participantIds: ['u1', 'u2', 'u3'],
+    speakerMap: new Map([[0, '김철수'], [1, '이영희'], [2, '박민수']]),
+    speakers: [],
+    transcript: makeSampleTranscript(),
+    transcriptCount: 10,
+    transcriptFilePath: null,
+    warnings: [],
+    aggregatedAt: new Date().toISOString(),
+    ...overrides,
+  };
+}
+
+describe('renderMinutesFromSession', () => {
+  it('renders complete Korean minutes from SessionMinutesData', () => {
+    const sessionData = makeSessionData();
+    const output = renderMinutesFromSession(sessionData);
+
+    // Required section headers
+    assert.ok(output.includes('# 회의록'), 'Has Korean title');
+    assert.ok(output.includes('## 참석자'), 'Has participants section');
+    assert.ok(output.includes('## 전체 녹취록'), 'Has full transcript section');
+    assert.ok(output.includes('## 요약'), 'Has summary section');
+    assert.ok(output.includes('## 결정 사항'), 'Has decisions section');
+    assert.ok(output.includes('## 액션 아이템'), 'Has action items section');
+  });
+
+  it('includes date in the output', () => {
+    const sessionData = makeSessionData();
+    const output = renderMinutesFromSession(sessionData);
+    assert.ok(output.includes('2026-04-03'), 'Date is present');
+    assert.ok(output.includes('날짜'), 'Date label is present');
+  });
+
+  it('includes all participants resolved from speakerMap', () => {
+    const sessionData = makeSessionData();
+    const output = renderMinutesFromSession(sessionData);
+    assert.ok(output.includes('김철수'), 'Speaker 0 resolved');
+    assert.ok(output.includes('이영희'), 'Speaker 1 resolved');
+    assert.ok(output.includes('박민수'), 'Speaker 2 resolved');
+  });
+
+  it('renders complete English minutes from SessionMinutesData', () => {
+    const sessionData = makeSessionData({
+      language: 'en',
+      speakerMap: new Map([[0, 'Alice'], [1, 'Bob']]),
+      transcript: [
+        makeEntry({ text: 'We decided to use the new framework', speaker: 0, start: 0, end: 3 }),
+        makeEntry({ text: "I'll handle the deployment by tomorrow", speaker: 1, start: 4, end: 7 }),
+      ],
+    });
+    const output = renderMinutesFromSession(sessionData);
+
+    assert.ok(output.includes('# Meeting Minutes'), 'Has English title');
+    assert.ok(output.includes('## Attendees'), 'Has Attendees section');
+    assert.ok(output.includes('## Full Transcript'), 'Has Full Transcript section');
+    assert.ok(output.includes('## Summary'), 'Has Summary section');
+    assert.ok(output.includes('## Decisions'), 'Has Decisions section');
+    assert.ok(output.includes('## Action Items'), 'Has Action Items section');
+  });
+
+  it('enforces template order for Korean: date → participants → transcript → summary → decisions → action items', () => {
+    const output = renderMinutesFromSession(makeSessionData());
+
+    const idxDate         = output.indexOf('날짜');
+    const idxParticipants = output.indexOf('## 참석자');
+    const idxTranscript   = output.indexOf('## 전체 녹취록');
+    const idxSummary      = output.indexOf('## 요약');
+    const idxDecisions    = output.indexOf('## 결정 사항');
+    const idxActionItems  = output.indexOf('## 액션 아이템');
+
+    assert.ok(idxDate >= 0,         'Date field present');
+    assert.ok(idxParticipants >= 0, 'Participants section present');
+    assert.ok(idxTranscript >= 0,   'Full transcript section present');
+    assert.ok(idxSummary >= 0,      'Summary section present');
+    assert.ok(idxDecisions >= 0,    'Decisions section present');
+    assert.ok(idxActionItems >= 0,  'Action items section present');
+
+    assert.ok(idxDate < idxParticipants,    'Date before participants');
+    assert.ok(idxParticipants < idxTranscript, 'Participants before transcript');
+    assert.ok(idxTranscript < idxSummary,   'Transcript before summary');
+    assert.ok(idxSummary < idxDecisions,    'Summary before decisions');
+    assert.ok(idxDecisions < idxActionItems,'Decisions before action items');
+  });
+
+  it('accepts speakerMap as a plain object (not a Map)', () => {
+    const sessionData = makeSessionData({
+      speakerMap: { 0: 'Alice', 1: 'Bob' }, // plain object, not a Map
+      transcript: [makeEntry({ text: 'Hello', speaker: 0, start: 0, end: 2 })],
+    });
+    // Should not throw — plain objects must be converted to Map internally
+    assert.doesNotThrow(() => renderMinutesFromSession(sessionData));
+    const output = renderMinutesFromSession(sessionData);
+    assert.ok(output.includes('Alice'), 'Resolved speaker from plain-object speakerMap');
+  });
+
+  it('accepts startedAt as an ISO string (not a Date)', () => {
+    const sessionData = makeSessionData({ startedAt: '2026-04-03T10:00:00Z' });
+    assert.doesNotThrow(() => renderMinutesFromSession(sessionData));
+    const output = renderMinutesFromSession(sessionData);
+    assert.ok(output.includes('2026-04-03'), 'Date rendered correctly from ISO string');
+  });
+
+  it('handles empty transcript gracefully', () => {
+    const sessionData = makeSessionData({ transcript: [], transcriptCount: 0 });
+    const output = renderMinutesFromSession(sessionData);
+    assert.ok(output.includes('# 회의록'), 'Title still present');
+    assert.ok(
+      output.includes('참석자가 감지되지 않았습니다') || output.includes('## 참석자'),
+      'Handles empty participants gracefully'
+    );
+  });
+
+  it('throws TypeError for invalid sessionData argument', () => {
+    assert.throws(() => renderMinutesFromSession(null),      /TypeError|sessionData/i);
+    assert.throws(() => renderMinutesFromSession(undefined), /TypeError|sessionData/i);
+    assert.throws(() => renderMinutesFromSession('string'),  /TypeError|sessionData/i);
+  });
+
+  it('passes opts through to formatMeetingMinutes', () => {
+    const sessionData = makeSessionData();
+
+    // includeTranscript: false should omit the transcript section
+    const outputNoTranscript = renderMinutesFromSession(sessionData, { includeTranscript: false });
+    assert.ok(!outputNoTranscript.includes('## 전체 녹취록'), 'Transcript omitted when includeTranscript=false');
+
+    // Custom title
+    const outputCustomTitle = renderMinutesFromSession(sessionData, { title: 'Sprint Review' });
+    assert.ok(outputCustomTitle.includes('# Sprint Review'), 'Custom title rendered');
+  });
+
+  it('includes server and channel metadata in output', () => {
+    const output = renderMinutesFromSession(makeSessionData());
+    assert.ok(output.includes('Test Server'), 'Server name present');
+    assert.ok(output.includes('general-voice'), 'Channel name present');
+    assert.ok(output.includes('TestUser'), 'Started-by name present');
+  });
+
+  it('includes footer with generation timestamp', () => {
+    const output = renderMinutesFromSession(makeSessionData());
+    assert.ok(output.includes('Generated by dicoclerk'), 'Footer present');
   });
 });

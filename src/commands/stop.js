@@ -5,6 +5,8 @@ import { generateAndDeliverMinutes } from '../minutes/generator.js';
  * Handle /stop slash command — end recording and trigger minutes generation.
  * Uses shared cleanupSession() for teardown, then triggers minutes generation.
  *
+ * Only a participant currently in the active voice channel may stop the session.
+ *
  * @param {import('discord.js').ChatInputCommandInteraction} interaction
  * @param {import('../voice/session-manager.js').SessionManager} sessionManager
  */
@@ -12,6 +14,20 @@ export async function handleStop(interaction, sessionManager) {
   if (!sessionManager.hasSession(interaction.guildId)) {
     await interaction.reply({
       content: '❌ No active recording session in this server.',
+      ephemeral: true,
+    });
+    return;
+  }
+
+  // Validate: invoker must be in the active voice channel.
+  // Fetch the session early (before deferReply) so we can check the channel ID
+  // without incurring a slow defer first.
+  const activeSession = sessionManager.getSession(interaction.guildId);
+  const memberVoiceChannelId = interaction.member?.voice?.channel?.id;
+
+  if (!memberVoiceChannelId || memberVoiceChannelId !== activeSession?.voiceChannelId) {
+    await interaction.reply({
+      content: `❌ You must be in the active voice channel <#${activeSession?.voiceChannelId}> to stop the recording.`,
       ephemeral: true,
     });
     return;
@@ -52,6 +68,11 @@ export async function handleStop(interaction, sessionManager) {
       transcriptResult: {
         transcript: result.transcript,
         filePath: result.transcriptFilePath,
+        // Pass the resolved speaker map from the coordinator (after #resolveAllSpeakerNames ran)
+        // so that aggregateSessionData uses the fully-enriched speaker identities.
+        speakerMap: result.speakerMap,
+        // Pass the structured per-session transcript store for richer minutes generation
+        transcriptSession: result.transcriptSession ?? null,
       },
       client: interaction.client,
       reason: 'manual_stop',

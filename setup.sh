@@ -39,6 +39,9 @@ EXISTING_DISCORD_GUILD_ID=""
 EXISTING_STT_LANGUAGE=""
 EXISTING_MINUTES_CHANNEL_ID=""
 EXISTING_DATA_DIR=""
+EXISTING_OPENAI_API_KEY=""
+EXISTING_ANTHROPIC_API_KEY=""
+EXISTING_LLM_MODEL=""
 
 if [[ -f "$ENV_FILE" ]]; then
     warn "Existing .env file found. Current values will be shown as defaults."
@@ -58,6 +61,9 @@ if [[ -f "$ENV_FILE" ]]; then
             STT_LANGUAGE)         EXISTING_STT_LANGUAGE="$value" ;;
             MINUTES_CHANNEL_ID)   EXISTING_MINUTES_CHANNEL_ID="$value" ;;
             DATA_DIR)             EXISTING_DATA_DIR="$value" ;;
+            OPENAI_API_KEY)       EXISTING_OPENAI_API_KEY="$value" ;;
+            ANTHROPIC_API_KEY)    EXISTING_ANTHROPIC_API_KEY="$value" ;;
+            LLM_MODEL)            EXISTING_LLM_MODEL="$value" ;;
         esac
     done < "$ENV_FILE"
 fi
@@ -80,11 +86,51 @@ prompt_value() {
         echo -en "  ${prompt_text}: "
     fi
 
-    read -r result
+    if [[ "$is_secret" == "true" ]]; then
+        read -rs result
+        echo ""   # newline after silent input
+    else
+        read -r result
+    fi
     if [[ -z "$result" ]]; then
         result="$default_val"
     fi
     echo "$result"
+}
+
+# ─── Helper: validate Discord bot token (basic sanity check) ────────
+validate_discord_token() {
+    local token="$1"
+    # Discord tokens are three base64url segments separated by dots.
+    # Minimum realistic length is ~59 chars; reject obviously wrong values.
+    if [[ ${#token} -lt 50 ]]; then
+        return 1
+    fi
+    # Must contain at least one dot (separator between header.payload.sig)
+    if [[ "$token" != *.* ]]; then
+        return 1
+    fi
+    return 0
+}
+
+# ─── Helper: validate Discord snowflake ID (17-19 digit number) ──────
+validate_snowflake() {
+    local id="$1"
+    [[ -z "$id" ]] && return 0   # optional field — empty is OK
+    if [[ ! "$id" =~ ^[0-9]{17,20}$ ]]; then
+        return 1
+    fi
+    return 0
+}
+
+# ─── Helper: validate Deepgram API key (non-empty, min length) ───────
+validate_deepgram_key() {
+    local key="$1"
+    # Deepgram keys are 40-char hex strings; reject obviously wrong values.
+    if [[ ${#key} -lt 20 ]]; then
+        return 1
+    fi
+    return 0
 }
 
 # ─── Helper: prompt required (no empty allowed) ─────────────────────
@@ -116,21 +162,50 @@ info "  • GUILD VOICE STATES intent enabled"
 info "  • GUILD MEMBERS intent enabled (for speaker identification)"
 echo ""
 
-DISCORD_TOKEN=$(prompt_required "Discord Bot Token" "$EXISTING_DISCORD_TOKEN" "true")
+while true; do
+    DISCORD_TOKEN=$(prompt_required "Discord Bot Token" "$EXISTING_DISCORD_TOKEN" "true")
+    if validate_discord_token "$DISCORD_TOKEN"; then
+        break
+    fi
+    error "That doesn't look like a valid Discord bot token (too short or missing '.' separator)."
+    error "Copy it from: Discord Developer Portal → Your App → Bot → Token"
+    EXISTING_DISCORD_TOKEN=""
+done
 
 echo ""
 info "The Client ID (Application ID) is on the General Information page."
-DISCORD_CLIENT_ID=$(prompt_required "Discord Client ID (Application ID)" "$EXISTING_DISCORD_CLIENT_ID")
+while true; do
+    DISCORD_CLIENT_ID=$(prompt_required "Discord Client ID (Application ID)" "$EXISTING_DISCORD_CLIENT_ID")
+    if validate_snowflake "$DISCORD_CLIENT_ID"; then
+        break
+    fi
+    error "Client ID must be a 17–20 digit numeric snowflake. Enable Developer Mode and copy from General Information."
+    EXISTING_DISCORD_CLIENT_ID=""
+done
 
 echo ""
 info "Guild ID is used for faster slash command registration during development."
 info "Right-click your server → Copy Server ID (enable Developer Mode in settings)."
-DISCORD_GUILD_ID=$(prompt_value "Discord Guild ID (optional, recommended)" "$EXISTING_DISCORD_GUILD_ID")
+while true; do
+    DISCORD_GUILD_ID=$(prompt_value "Discord Guild ID (optional, recommended)" "$EXISTING_DISCORD_GUILD_ID")
+    if validate_snowflake "$DISCORD_GUILD_ID"; then
+        break
+    fi
+    error "Guild ID must be a 17–20 digit numeric snowflake (or leave blank to skip)."
+    EXISTING_DISCORD_GUILD_ID=""
+done
 
 echo ""
 info "Channel where meeting minutes will be posted after each session."
 info "Right-click a text channel → Copy Channel ID."
-MINUTES_CHANNEL_ID=$(prompt_value "Minutes Text Channel ID (optional, configurable per-session)" "$EXISTING_MINUTES_CHANNEL_ID")
+while true; do
+    MINUTES_CHANNEL_ID=$(prompt_value "Minutes Text Channel ID (optional, configurable per-session)" "$EXISTING_MINUTES_CHANNEL_ID")
+    if validate_snowflake "$MINUTES_CHANNEL_ID"; then
+        break
+    fi
+    error "Channel ID must be a 17–20 digit numeric snowflake (or leave blank to skip)."
+    EXISTING_MINUTES_CHANNEL_ID=""
+done
 
 echo ""
 success "Discord configuration collected."
@@ -145,7 +220,15 @@ info "Get your Deepgram API key from https://console.deepgram.com"
 info "A free tier account provides \$200 in credits."
 echo ""
 
-DEEPGRAM_API_KEY=$(prompt_required "Deepgram API Key" "$EXISTING_DEEPGRAM_API_KEY" "true")
+while true; do
+    DEEPGRAM_API_KEY=$(prompt_required "Deepgram API Key" "$EXISTING_DEEPGRAM_API_KEY" "true")
+    if validate_deepgram_key "$DEEPGRAM_API_KEY"; then
+        break
+    fi
+    error "That doesn't look like a valid Deepgram API key (too short)."
+    error "Copy it from: https://console.deepgram.com → API Keys"
+    EXISTING_DEEPGRAM_API_KEY=""
+done
 
 echo ""
 echo -e "  Select STT language support:"
@@ -176,7 +259,56 @@ success "Deepgram configuration collected (language: ${STT_LANGUAGE})."
 echo ""
 
 # ═══════════════════════════════════════════════════════════════════
-# Section 3: Storage Configuration
+# Section 3: LLM Configuration (optional — for AI-enhanced minutes)
+# ═══════════════════════════════════════════════════════════════════
+echo -e "${BOLD}─── LLM Configuration (Optional) ──────────────────${NC}"
+echo ""
+info "dicoclerk can use an LLM to generate AI-enhanced meeting summaries,"
+info "decisions, and action items. If no key is provided, heuristic extraction"
+info "is used (fully offline, no external API calls)."
+echo ""
+echo -e "  Select LLM provider:"
+echo -e "    ${CYAN}1)${NC} OpenAI (GPT-4o-mini or custom model) ${YELLOW}[recommended]${NC}"
+echo -e "    ${CYAN}2)${NC} Anthropic Claude (claude-3-haiku or custom)"
+echo -e "    ${CYAN}3)${NC} Skip — use offline heuristic extraction only"
+echo ""
+echo -en "  LLM provider choice [3]: "
+read -r LLM_PROVIDER_CHOICE
+LLM_PROVIDER_CHOICE="${LLM_PROVIDER_CHOICE:-3}"
+
+OPENAI_API_KEY=""
+ANTHROPIC_API_KEY=""
+LLM_MODEL=""
+
+case "$LLM_PROVIDER_CHOICE" in
+    1)
+        echo ""
+        info "Get your OpenAI API key from https://platform.openai.com/api-keys"
+        OPENAI_API_KEY=$(prompt_required "OpenAI API Key" "$EXISTING_OPENAI_API_KEY" "true")
+        DEFAULT_MODEL="gpt-4o-mini"
+        LLM_MODEL=$(prompt_value "Model name (leave blank for default: ${DEFAULT_MODEL})" "${EXISTING_LLM_MODEL:-$DEFAULT_MODEL}")
+        [[ "$LLM_MODEL" == "$DEFAULT_MODEL" ]] && LLM_MODEL=""
+        echo ""
+        success "OpenAI configuration collected."
+        ;;
+    2)
+        echo ""
+        info "Get your Anthropic API key from https://console.anthropic.com"
+        ANTHROPIC_API_KEY=$(prompt_required "Anthropic API Key" "$EXISTING_ANTHROPIC_API_KEY" "true")
+        DEFAULT_MODEL="claude-3-haiku-20240307"
+        LLM_MODEL=$(prompt_value "Model name (leave blank for default: ${DEFAULT_MODEL})" "${EXISTING_LLM_MODEL:-$DEFAULT_MODEL}")
+        [[ "$LLM_MODEL" == "$DEFAULT_MODEL" ]] && LLM_MODEL=""
+        echo ""
+        success "Anthropic configuration collected."
+        ;;
+    *)
+        info "Skipping LLM configuration — offline heuristic extraction will be used."
+        ;;
+esac
+echo ""
+
+# ═══════════════════════════════════════════════════════════════════
+# Section 4: Storage Configuration
 # ═══════════════════════════════════════════════════════════════════
 echo -e "${BOLD}─── Storage Configuration ─────────────────────────${NC}"
 echo ""
@@ -220,6 +352,18 @@ STT_LANGUAGE=${STT_LANGUAGE}
 
 # Data storage directory (transcripts, minutes, recordings)
 DATA_DIR=${DATA_DIR}
+
+# LLM Configuration (optional — for AI-enhanced meeting minutes)
+# Leave blank to use offline heuristic extraction only.
+# OPENAI_API_KEY takes priority over ANTHROPIC_API_KEY when both are set.
+OPENAI_API_KEY=${OPENAI_API_KEY}
+ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+# Override the default model (gpt-4o-mini / claude-3-haiku-20240307)
+LLM_MODEL=${LLM_MODEL}
+# Override API base URL for OpenAI-compatible endpoints (Azure, LocalAI, etc.)
+# LLM_BASE_URL=
+# LLM timeout in milliseconds (default: 60000)
+# LLM_TIMEOUT_MS=60000
 EOF
 
 success ".env file written to: ${ENV_FILE}"
@@ -276,9 +420,14 @@ echo -e "${BOLD}║          ${GREEN}Setup Complete!${NC}${BOLD}                
 echo -e "${BOLD}╚══════════════════════════════════════════╝${NC}"
 echo ""
 echo -e "  ${BOLD}Quick Start:${NC}"
-echo -e "    ${CYAN}npm start${NC}          — Run the bot"
-echo -e "    ${CYAN}npm run dev${NC}        — Run with auto-reload"
-echo -e "    ${CYAN}npm run mcp${NC}        — Run as MCP server"
+echo -e "    ${CYAN}npm start${NC}              — Run the bot"
+echo -e "    ${CYAN}npm run dev${NC}            — Run with auto-reload"
+echo -e "    ${CYAN}npm run mcp${NC}            — Run as MCP server"
+echo ""
+echo -e "  ${BOLD}Slash Commands:${NC}"
+echo -e "    ${CYAN}/start${NC}                 — Join voice channel & begin recording"
+echo -e "    ${CYAN}/stop${NC}                  — End session & generate meeting minutes"
+echo -e "    ${CYAN}/setup channel:#name${NC}   — Set text channel for minutes delivery"
 echo ""
 echo -e "  ${BOLD}Bot Invite URL:${NC}"
 echo -e "    https://discord.com/api/oauth2/authorize?client_id=${DISCORD_CLIENT_ID}&permissions=36727824&scope=bot%20applications.commands"

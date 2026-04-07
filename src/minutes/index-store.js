@@ -17,14 +17,30 @@
  * and supports filtering by date range, channel, participants, etc.
  */
 
-import { readFile, writeFile, mkdir } from 'node:fs/promises';
+import { readFile, writeFile, rename, mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 
 /** Directory for storing generated minutes */
 const DATA_DIR = join(process.cwd(), 'data');
-const MINUTES_DIR = join(DATA_DIR, 'minutes');
-const INDEX_FILE = join(MINUTES_DIR, 'index.json');
+let MINUTES_DIR = join(DATA_DIR, 'minutes');
+let INDEX_FILE = join(MINUTES_DIR, 'index.json');
+
+/**
+ * Override the minutes directory and index file paths.
+ * Intended for testing only — resets to the production path when called with null.
+ *
+ * @param {string|null} dir - Absolute path to use as MINUTES_DIR, or null to reset
+ */
+export function _setMinutesDir(dir) {
+  if (dir === null) {
+    MINUTES_DIR = join(process.cwd(), 'data', 'minutes');
+    INDEX_FILE = join(MINUTES_DIR, 'index.json');
+  } else {
+    MINUTES_DIR = dir;
+    INDEX_FILE = join(dir, 'index.json');
+  }
+}
 
 /**
  * @typedef {Object} MinutesIndexEntry
@@ -82,7 +98,9 @@ export async function loadIndex() {
 }
 
 /**
- * Save the minutes index to disk.
+ * Save the minutes index to disk using an atomic write.
+ * Writes to a temporary file first, then renames to prevent
+ * partial writes from corrupting the index on crash.
  *
  * @param {MinutesIndex} index
  * @returns {Promise<void>}
@@ -91,7 +109,9 @@ export async function saveIndex(index) {
   await mkdir(MINUTES_DIR, { recursive: true });
   index.updatedAt = new Date().toISOString();
   const json = JSON.stringify(index, null, 2);
-  await writeFile(INDEX_FILE, json, 'utf-8');
+  const tmpFile = INDEX_FILE + '.tmp';
+  await writeFile(tmpFile, json, 'utf-8');
+  await rename(tmpFile, INDEX_FILE);
 }
 
 /**
@@ -612,6 +632,193 @@ export async function searchEntriesWithContent(filters = {}) {
     entries: paged,
     total,
     showing: paged.length,
+  };
+}
+
+/**
+ * @typedef {Object} DateIndexEntry
+ * @property {string} date              - ISO date string (YYYY-MM-DD)
+ * @property {number} count             - Number of sessions on this date
+ * @property {string[]} channelNames    - Unique channel names active on this date
+ * @property {string[]} sessionIds      - Session IDs for sessions on this date
+ */
+
+/**
+ * @typedef {Object} ChannelIndexEntry
+ * @property {string} channelName       - Voice channel name
+ * @property {string} guildId           - Discord guild ID
+ * @property {string} guildName         - Discord guild name
+ * @property {number} count             - Number of sessions in this channel
+ * @property {string} firstDate         - ISO date of earliest session
+ * @property {string} lastDate          - ISO date of most recent session
+ * @property {string[]} sessionIds      - Session IDs for sessions in this channel
+ */
+
+/**
+ * @typedef {Object} IndexStats
+ * @property {number} totalSessions           - Total number of indexed sessions
+ * @property {number} totalDurationSeconds    - Sum of all session durations
+ * @property {string|null} earliestDate       - YYYY-MM-DD of the oldest session
+ * @property {string|null} latestDate         - YYYY-MM-DD of the newest session
+ * @property {number} uniqueDates             - Number of distinct meeting dates
+ * @property {number} uniqueChannels          - Number of distinct channel names
+ * @property {number} uniqueGuilds            - Number of distinct guild IDs
+ * @property {string[]} languages             - All distinct language codes present
+ * @property {string} indexUpdatedAt          - Last time the index was updated (ISO)
+ */
+
+/**
+ * List all unique meeting dates, sorted newest-first.
+ * Each entry carries the session count, channel names, and session IDs for that date.
+ *
+ * @param {string} [guildId] - Optional guild filter
+ * @returns {Promise<DateIndexEntry[]>}
+ */
+export async function listDates(guildId) {
+  const index = await loadIndex();
+  let entries = index.entries;
+
+  if (guildId) {
+    entries = entries.filter(e => e.guildId === guildId);
+  }
+
+  /** @type {Map<string, DateIndexEntry>} */
+  const byDate = new Map();
+
+  for (const entry of entries) {
+    const date = entry.date ?? 'unknown';
+    if (!byDate.has(date)) {
+      byDate.set(date, { date, count: 0, channelNames: [], sessionIds: [] });
+    }
+    const bucket = byDate.get(date);
+    bucket.count++;
+    bucket.sessionIds.push(entry.sessionId);
+    if (!bucket.channelNames.includes(entry.channelName)) {
+      bucket.channelNames.push(entry.channelName);
+    }
+  }
+
+  // Sort by date descending (newest first)
+  return Array.from(byDate.values()).sort((a, b) => b.date.localeCompare(a.date));
+}
+
+/**
+ * List all unique voice channels that have recorded minutes, sorted by most-recent activity.
+ * Each entry includes the guild context, session count, date range, and session IDs.
+ *
+ * @param {string} [guildId] - Optional guild filter
+ * @returns {Promise<ChannelIndexEntry[]>}
+ */
+export async function listChannels(guildId) {
+  const index = await loadIndex();
+  let entries = index.entries;
+
+  if (guildId) {
+    entries = entries.filter(e => e.guildId === guildId);
+  }
+
+  // Key: "guildId::channelName" to handle same-named channels in different guilds
+  /** @type {Map<string, ChannelIndexEntry>} */
+  const byChannel = new Map();
+
+  for (const entry of entries) {
+    const key = `${entry.guildId ?? ''}::${entry.channelName ?? 'unknown'}`;
+    if (!byChannel.has(key)) {
+      byChannel.set(key, {
+        channelName: entry.channelName ?? 'unknown',
+        guildId: entry.guildId ?? '',
+        guildName: entry.guildName ?? 'Unknown Server',
+        count: 0,
+        firstDate: entry.date,
+        lastDate: entry.date,
+        sessionIds: [],
+      });
+    }
+    const bucket = byChannel.get(key);
+    bucket.count++;
+    bucket.sessionIds.push(entry.sessionId);
+    if (entry.date < bucket.firstDate) bucket.firstDate = entry.date;
+    if (entry.date > bucket.lastDate) bucket.lastDate = entry.date;
+  }
+
+  // Sort by lastDate descending (most recently active first)
+  return Array.from(byChannel.values()).sort((a, b) => b.lastDate.localeCompare(a.lastDate));
+}
+
+/**
+ * Fetch all index entries for a given date and (optionally) channel name.
+ * Combines date and channel axes for direct lookup — the primary indexed query.
+ *
+ * @param {string} date            - YYYY-MM-DD
+ * @param {string} [channelName]   - Exact or partial channel name match (case-insensitive).
+ *                                   Omit to return all sessions on the given date.
+ * @param {string} [guildId]       - Optional guild filter
+ * @returns {Promise<MinutesIndexEntry[]>}
+ */
+export async function getByDateChannel(date, channelName, guildId) {
+  if (!date) throw new TypeError('[MinutesIndex] getByDateChannel: date is required');
+
+  const index = await loadIndex();
+  let results = index.entries.filter(e => e.date === date);
+
+  if (channelName) {
+    const needle = channelName.toLowerCase();
+    results = results.filter(e => e.channelName.toLowerCase().includes(needle));
+  }
+
+  if (guildId) {
+    results = results.filter(e => e.guildId === guildId);
+  }
+
+  // Sort by start time ascending within the day
+  results.sort((a, b) => new Date(a.startedAt) - new Date(b.startedAt));
+  return results;
+}
+
+/**
+ * Return aggregate statistics about the stored minutes index.
+ *
+ * @param {string} [guildId] - Optional guild filter
+ * @returns {Promise<IndexStats>}
+ */
+export async function getIndexStats(guildId) {
+  const index = await loadIndex();
+  let entries = index.entries;
+
+  if (guildId) {
+    entries = entries.filter(e => e.guildId === guildId);
+  }
+
+  if (entries.length === 0) {
+    return {
+      totalSessions: 0,
+      totalDurationSeconds: 0,
+      earliestDate: null,
+      latestDate: null,
+      uniqueDates: 0,
+      uniqueChannels: 0,
+      uniqueGuilds: 0,
+      languages: [],
+      indexUpdatedAt: index.updatedAt,
+    };
+  }
+
+  const dates      = entries.map(e => e.date).filter(Boolean).sort();
+  const channels   = new Set(entries.map(e => e.channelName ?? 'unknown'));
+  const guilds     = new Set(entries.map(e => e.guildId).filter(Boolean));
+  const languages  = [...new Set(entries.map(e => e.language).filter(Boolean))].sort();
+  const totalDurationSeconds = entries.reduce((sum, e) => sum + (e.durationSeconds ?? 0), 0);
+
+  return {
+    totalSessions: entries.length,
+    totalDurationSeconds,
+    earliestDate: dates[0] ?? null,
+    latestDate:   dates[dates.length - 1] ?? null,
+    uniqueDates:  new Set(dates).size,
+    uniqueChannels: channels.size,
+    uniqueGuilds: guilds.size,
+    languages,
+    indexUpdatedAt: index.updatedAt,
   };
 }
 

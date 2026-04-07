@@ -21,6 +21,15 @@ const commands = [
   new SlashCommandBuilder()
     .setName('stop')
     .setDescription('Stop recording and generate meeting minutes'),
+  new SlashCommandBuilder()
+    .setName('setup')
+    .setDescription('Configure the designated text channel for meeting minutes delivery')
+    .addChannelOption(option =>
+      option
+        .setName('channel')
+        .setDescription('Text channel where meeting minutes will be sent')
+        .setRequired(true)
+    ),
 ].map(command => command.toJSON());
 
 const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);

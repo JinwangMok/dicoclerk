@@ -187,25 +187,38 @@ export class VoiceConnectionManager extends EventEmitter {
         reason === VoiceConnectionDisconnectReason.WebSocketClose &&
         closeCode === 4014
       ) {
-        // Bot was kicked or moved — try to recover via adapter
+        // Bot was kicked or moved — wait for Discord adapter to attempt recovery.
+        // If Discord reassigns the bot to a channel, the connection will transition
+        // through Connecting → Ready automatically. We must NOT call rejoin() here,
+        // as the server-side state is being managed by Discord.
         try {
           await entersState(
             this.#connection,
             VoiceConnectionStatus.Connecting,
             VoiceConnectionManager.RECONNECT_TIMEOUT
           );
-          // Adapter recovered; it will transition to Ready on its own
-          console.log('[VoiceConnection] Adapter recovery initiated after 4014');
+          // Adapter is recovering — now wait for full Ready state
+          await entersState(
+            this.#connection,
+            VoiceConnectionStatus.Ready,
+            VoiceConnectionManager.RECONNECT_TIMEOUT
+          );
+          this.#state = 'ready';
+          this.#reconnectAttempts = 0;
+          this.emit('stateChange', { oldStatus: 'reconnecting', newStatus: 'ready' });
+          this.emit('ready');
+          console.log('[VoiceConnection] Reconnected successfully after 4014 recovery');
         } catch {
           // Adapter didn't recover — destroy cleanly
           console.log('[VoiceConnection] Adapter recovery failed after 4014, destroying');
           this.destroy();
         }
       } else if (this.#reconnectAttempts < VoiceConnectionManager.MAX_RECONNECT_ATTEMPTS) {
-        // Network disconnection — attempt reconnection
+        // Network disconnection — actively attempt reconnection via rejoin()
         this.#reconnectAttempts++;
+        const oldStatus = this.#state;
         this.#state = 'reconnecting';
-        this.emit('stateChange', { oldStatus: 'ready', newStatus: 'reconnecting' });
+        this.emit('stateChange', { oldStatus, newStatus: 'reconnecting' });
         this.emit('reconnecting');
 
         console.log(
@@ -213,6 +226,11 @@ export class VoiceConnectionManager extends EventEmitter {
         );
 
         try {
+          // Actively signal the connection to rejoin the channel.
+          // Without this, the connection stays stuck in Disconnected state —
+          // @discordjs/voice does not auto-reconnect non-4014 disconnects.
+          this.#connection.rejoin();
+
           await entersState(
             this.#connection,
             VoiceConnectionStatus.Ready,
@@ -231,7 +249,7 @@ export class VoiceConnectionManager extends EventEmitter {
             this.emit('error', new Error('Voice connection lost after maximum reconnect attempts'));
             this.destroy();
           }
-          // Otherwise the Disconnected event will fire again and we'll retry
+          // Otherwise the Disconnected event will fire again on the next attempt
         }
       } else {
         // Exhausted reconnect attempts
@@ -242,11 +260,13 @@ export class VoiceConnectionManager extends EventEmitter {
     });
 
     this.#connection.on(VoiceConnectionStatus.Destroyed, () => {
-      console.log('[VoiceConnection] Connection destroyed');
+      // Capture previous state BEFORE mutating this.#state
+      const oldStatus = this.#state;
+      console.log(`[VoiceConnection] Connection destroyed (was: ${oldStatus})`);
       this.#state = 'destroyed';
       this.#subscribedUsers.clear();
       this.#connection = null;
-      this.emit('stateChange', { oldStatus: this.#state, newStatus: 'destroyed' });
+      this.emit('stateChange', { oldStatus, newStatus: 'destroyed' });
       this.emit('destroyed');
     });
 
@@ -346,8 +366,13 @@ export class VoiceConnectionManager extends EventEmitter {
 
     this.#subscribedUsers.clear();
 
+    // Capture oldStatus BEFORE any mutation so stateChange reports the correct prior state
+    const oldStatus = this.#state;
+
     if (this.#connection) {
       try {
+        // connection.destroy() may fire VoiceConnectionStatus.Destroyed synchronously,
+        // which would already set this.#state = 'destroyed' and emit stateChange/destroyed.
         this.#connection.destroy();
       } catch {
         // Already destroyed
@@ -355,7 +380,16 @@ export class VoiceConnectionManager extends EventEmitter {
       this.#connection = null;
     }
 
+    // Guard: if the VoiceConnectionStatus.Destroyed handler already ran (fired
+    // synchronously from this.#connection.destroy() above), state is already
+    // 'destroyed' and events were already emitted — avoid double-emitting.
+    if (this.#state === 'destroyed') {
+      this.removeAllListeners();
+      return;
+    }
+
     this.#state = 'destroyed';
+    this.emit('stateChange', { oldStatus, newStatus: 'destroyed' });
     this.emit('destroyed');
     this.removeAllListeners();
   }

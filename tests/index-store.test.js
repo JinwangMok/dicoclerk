@@ -15,7 +15,63 @@ import {
   parseMetadataFromMarkdown,
   parseDurationString,
   searchEntriesWithContent,
+  loadIndex,
+  saveIndex,
+  addEntry,
+  getEntryBySessionId,
+  getLatestEntry,
+  removeEntry,
+  rebuildIndex,
+  searchEntries,
+  listDates,
+  listChannels,
+  getByDateChannel,
+  getIndexStats,
+  _setMinutesDir,
 } from '../src/minutes/index-store.js';
+
+// ---------------------------------------------------------------------------
+// Helpers for isolated temp-dir tests
+// ---------------------------------------------------------------------------
+
+/**
+ * Create an isolated temporary directory for one test run.
+ * Calls _setMinutesDir so the module writes there instead of data/minutes.
+ *
+ * @returns {Promise<{ dir: string, cleanup: () => Promise<void> }>}
+ */
+async function makeTempMinutesDir() {
+  const dir = join(tmpdir(), `dicoclerk-test-${randomUUID()}`);
+  await mkdir(dir, { recursive: true });
+  _setMinutesDir(dir);
+  return {
+    dir,
+    async cleanup() {
+      _setMinutesDir(null); // restore production path
+      await rm(dir, { recursive: true, force: true });
+    },
+  };
+}
+
+/** Build a minimal sample entry params object. */
+function sampleEntryParams(overrides = {}) {
+  return {
+    filename: `minutes_2026-04-01_100000_test-chan.md`,
+    filePath: `/data/minutes/minutes_2026-04-01_100000_test-chan.md`,
+    sessionId: randomUUID(),
+    startedAt: new Date('2026-04-01T10:00:00.000Z'),
+    durationSeconds: 300,
+    guildId: 'guild-1',
+    guildName: 'Test Guild',
+    channelId: 'ch-1',
+    channelName: 'test-chan',
+    participants: ['Alice', 'Bob'],
+    transcriptCount: 20,
+    language: 'en',
+    startedBy: 'Alice',
+    ...overrides,
+  };
+}
 
 describe('parseDurationString', () => {
   it('parses hours, minutes, seconds', () => {
@@ -303,5 +359,964 @@ describe('searchEntries (unit logic)', () => {
     assert.ok(typeof entry.durationSeconds === 'number');
     assert.ok(typeof entry.participantCount === 'number');
     assert.ok(typeof entry.transcriptCount === 'number');
+  });
+});
+
+// ===========================================================================
+// CRUD integration tests (isolated temp directories via _setMinutesDir)
+// ===========================================================================
+
+describe('loadIndex / saveIndex (file I/O)', () => {
+  let cleanup;
+
+  afterEach(async () => {
+    if (cleanup) { await cleanup(); cleanup = null; }
+  });
+
+  it('returns empty index when index file does not exist', async () => {
+    ({ cleanup } = await makeTempMinutesDir());
+    const index = await loadIndex();
+    assert.equal(index.version, 1);
+    assert.deepEqual(index.entries, []);
+    assert.ok(index.updatedAt);
+  });
+
+  it('saves and reloads an index', async () => {
+    ({ cleanup } = await makeTempMinutesDir());
+    const original = createEmptyIndex();
+    original.entries.push({ sessionId: 'abc', date: '2026-04-01', channelName: 'x' });
+    await saveIndex(original);
+
+    const loaded = await loadIndex();
+    assert.equal(loaded.entries.length, 1);
+    assert.equal(loaded.entries[0].sessionId, 'abc');
+  });
+
+  it('createEmptyIndex returns fresh object each call', () => {
+    const a = createEmptyIndex();
+    const b = createEmptyIndex();
+    a.entries.push({ x: 1 });
+    assert.equal(b.entries.length, 0);
+  });
+
+  it('saveIndex creates the minutes directory if absent', async () => {
+    ({ cleanup } = await makeTempMinutesDir());
+    // Remove directory to test creation
+    const { rm: rmFn } = await import('node:fs/promises');
+    const { MINUTES_DIR: mDir } = await import('../src/minutes/index-store.js');
+    // saveIndex should create the dir
+    await saveIndex(createEmptyIndex());
+    const { access } = await import('node:fs/promises');
+    // No throw means directory exists
+    await access(mDir);
+  });
+
+  it('returns empty index for malformed JSON file', async () => {
+    const { dir, cleanup: c } = await makeTempMinutesDir();
+    cleanup = c;
+    await writeFile(join(dir, 'index.json'), '{ invalid json !!!', 'utf-8');
+    const index = await loadIndex();
+    assert.deepEqual(index.entries, []);
+  });
+});
+
+describe('addEntry', () => {
+  let cleanup;
+
+  afterEach(async () => {
+    if (cleanup) { await cleanup(); cleanup = null; }
+  });
+
+  it('persists a new entry to the index file', async () => {
+    ({ cleanup } = await makeTempMinutesDir());
+    const params = sampleEntryParams();
+    const entry = await addEntry(params);
+
+    assert.equal(entry.sessionId, params.sessionId);
+    assert.equal(entry.channelName, 'test-chan');
+    assert.equal(entry.guildId, 'guild-1');
+    assert.deepEqual(entry.participants, ['Alice', 'Bob']);
+    assert.equal(entry.participantCount, 2);
+    assert.equal(entry.transcriptCount, 20);
+    assert.equal(entry.language, 'en');
+    assert.equal(entry.durationSeconds, 300);
+
+    // Reload from disk and verify persistence
+    const reloaded = await loadIndex();
+    assert.equal(reloaded.entries.length, 1);
+    assert.equal(reloaded.entries[0].sessionId, params.sessionId);
+  });
+
+  it('auto-generates sessionId when not provided', async () => {
+    ({ cleanup } = await makeTempMinutesDir());
+    const params = sampleEntryParams();
+    delete params.sessionId;
+    const entry = await addEntry(params);
+
+    assert.ok(typeof entry.sessionId === 'string');
+    assert.ok(entry.sessionId.length > 0);
+  });
+
+  it('accumulates multiple entries', async () => {
+    ({ cleanup } = await makeTempMinutesDir());
+    await addEntry(sampleEntryParams({ sessionId: 'id-1', channelName: 'chan-a' }));
+    await addEntry(sampleEntryParams({ sessionId: 'id-2', channelName: 'chan-b' }));
+    await addEntry(sampleEntryParams({ sessionId: 'id-3', channelName: 'chan-c' }));
+
+    const index = await loadIndex();
+    assert.equal(index.entries.length, 3);
+    const ids = index.entries.map(e => e.sessionId);
+    assert.ok(ids.includes('id-1'));
+    assert.ok(ids.includes('id-2'));
+    assert.ok(ids.includes('id-3'));
+  });
+
+  it('stores correct date and time from startedAt', async () => {
+    ({ cleanup } = await makeTempMinutesDir());
+    const params = sampleEntryParams({ startedAt: new Date('2026-03-15T09:30:00.000Z') });
+    const entry = await addEntry(params);
+
+    assert.equal(entry.date, '2026-03-15');
+    assert.equal(entry.startedAt, '2026-03-15T09:30:00.000Z');
+  });
+
+  it('accepts string startedAt as well as Date', async () => {
+    ({ cleanup } = await makeTempMinutesDir());
+    const params = sampleEntryParams({ startedAt: '2026-03-15T09:30:00.000Z' });
+    const entry = await addEntry(params);
+    assert.equal(entry.date, '2026-03-15');
+  });
+
+  it('stores Korean language entries', async () => {
+    ({ cleanup } = await makeTempMinutesDir());
+    const params = sampleEntryParams({ language: 'ko', participants: ['철수', '영희'] });
+    const entry = await addEntry(params);
+    assert.equal(entry.language, 'ko');
+    assert.deepEqual(entry.participants, ['철수', '영희']);
+  });
+});
+
+describe('getEntryBySessionId', () => {
+  let cleanup;
+
+  afterEach(async () => {
+    if (cleanup) { await cleanup(); cleanup = null; }
+  });
+
+  it('returns the matching entry', async () => {
+    ({ cleanup } = await makeTempMinutesDir());
+    const id = randomUUID();
+    await addEntry(sampleEntryParams({ sessionId: id, channelName: 'my-channel' }));
+
+    const found = await getEntryBySessionId(id);
+    assert.ok(found !== null);
+    assert.equal(found.sessionId, id);
+    assert.equal(found.channelName, 'my-channel');
+  });
+
+  it('returns null for unknown session ID', async () => {
+    ({ cleanup } = await makeTempMinutesDir());
+    const found = await getEntryBySessionId('does-not-exist');
+    assert.equal(found, null);
+  });
+
+  it('returns correct entry when multiple entries exist', async () => {
+    ({ cleanup } = await makeTempMinutesDir());
+    const id1 = randomUUID();
+    const id2 = randomUUID();
+    await addEntry(sampleEntryParams({ sessionId: id1, channelName: 'alpha' }));
+    await addEntry(sampleEntryParams({ sessionId: id2, channelName: 'beta' }));
+
+    const found = await getEntryBySessionId(id2);
+    assert.equal(found.channelName, 'beta');
+  });
+});
+
+describe('getLatestEntry', () => {
+  let cleanup;
+
+  afterEach(async () => {
+    if (cleanup) { await cleanup(); cleanup = null; }
+  });
+
+  it('returns the most recent entry', async () => {
+    ({ cleanup } = await makeTempMinutesDir());
+    await addEntry(sampleEntryParams({ sessionId: 'old', startedAt: new Date('2026-01-01T00:00:00Z') }));
+    await addEntry(sampleEntryParams({ sessionId: 'new', startedAt: new Date('2026-04-01T00:00:00Z') }));
+
+    const latest = await getLatestEntry();
+    assert.equal(latest.sessionId, 'new');
+  });
+
+  it('returns null when index is empty', async () => {
+    ({ cleanup } = await makeTempMinutesDir());
+    const latest = await getLatestEntry();
+    assert.equal(latest, null);
+  });
+
+  it('filters by guildId when provided', async () => {
+    ({ cleanup } = await makeTempMinutesDir());
+    await addEntry(sampleEntryParams({ sessionId: 'g1-latest', guildId: 'guild-1', startedAt: new Date('2026-04-03T00:00:00Z') }));
+    await addEntry(sampleEntryParams({ sessionId: 'g2-only',   guildId: 'guild-2', startedAt: new Date('2026-04-04T00:00:00Z') }));
+
+    const latestG1 = await getLatestEntry('guild-1');
+    assert.equal(latestG1.sessionId, 'g1-latest');
+
+    const latestG2 = await getLatestEntry('guild-2');
+    assert.equal(latestG2.sessionId, 'g2-only');
+  });
+
+  it('returns null when guildId has no entries', async () => {
+    ({ cleanup } = await makeTempMinutesDir());
+    await addEntry(sampleEntryParams({ guildId: 'guild-A' }));
+
+    const result = await getLatestEntry('guild-B');
+    assert.equal(result, null);
+  });
+});
+
+describe('removeEntry', () => {
+  let cleanup;
+
+  afterEach(async () => {
+    if (cleanup) { await cleanup(); cleanup = null; }
+  });
+
+  it('removes an existing entry and returns true', async () => {
+    ({ cleanup } = await makeTempMinutesDir());
+    const id = randomUUID();
+    await addEntry(sampleEntryParams({ sessionId: id }));
+
+    const removed = await removeEntry(id);
+    assert.equal(removed, true);
+
+    const index = await loadIndex();
+    assert.equal(index.entries.length, 0);
+  });
+
+  it('returns false for a non-existent session ID', async () => {
+    ({ cleanup } = await makeTempMinutesDir());
+    const removed = await removeEntry('no-such-id');
+    assert.equal(removed, false);
+  });
+
+  it('only removes the targeted entry, leaving others intact', async () => {
+    ({ cleanup } = await makeTempMinutesDir());
+    const id1 = randomUUID();
+    const id2 = randomUUID();
+    const id3 = randomUUID();
+    await addEntry(sampleEntryParams({ sessionId: id1 }));
+    await addEntry(sampleEntryParams({ sessionId: id2 }));
+    await addEntry(sampleEntryParams({ sessionId: id3 }));
+
+    await removeEntry(id2);
+
+    const index = await loadIndex();
+    assert.equal(index.entries.length, 2);
+    const ids = index.entries.map(e => e.sessionId);
+    assert.ok(ids.includes(id1));
+    assert.ok(!ids.includes(id2));
+    assert.ok(ids.includes(id3));
+  });
+});
+
+describe('rebuildIndex', () => {
+  let cleanup;
+
+  afterEach(async () => {
+    if (cleanup) { await cleanup(); cleanup = null; }
+  });
+
+  const SAMPLE_MD = `# 회의록
+
+| | |
+|---|---|
+| **날짜** | 2026-04-03 |
+| **시간** | 18:58 |
+| **소요시간** | 5m 30s |
+| **서버** | Rebuild Server |
+| **채널** | rebuild-chan |
+| **시작** | RebuildUser |
+
+## 참석자
+
+| 이름 | 발화 수 | 발화 시간 |
+|---|---|---|
+| Alice | 10 | 2m 30s |
+| Bob | 5 | 1m 15s |
+
+## 요약
+
+회의 시간: **5m 30s**, 참석자 **2**명: Alice, Bob. 총 **15**건의 발화가 기록되었습니다.
+
+---
+_Generated by dicoclerk at 2026-04-03T09:59:20.101Z_
+`;
+
+  it('creates empty index when minutes directory is absent', async () => {
+    ({ cleanup } = await makeTempMinutesDir());
+    // Remove the directory completely
+    const { MINUTES_DIR: mDir } = await import('../src/minutes/index-store.js');
+    await rm(mDir, { recursive: true, force: true });
+
+    const index = await rebuildIndex();
+    assert.equal(index.entries.length, 0);
+    assert.equal(index.version, 1);
+  });
+
+  it('parses .md files and builds the index', async () => {
+    const { dir, cleanup: c } = await makeTempMinutesDir();
+    cleanup = c;
+
+    await writeFile(
+      join(dir, 'minutes_2026-04-03_185800_rebuild-chan.md'),
+      SAMPLE_MD,
+      'utf-8'
+    );
+
+    const index = await rebuildIndex();
+    assert.equal(index.entries.length, 1);
+    const e = index.entries[0];
+    assert.equal(e.channelName, 'rebuild-chan');
+    assert.equal(e.guildName, 'Rebuild Server');
+    assert.equal(e.durationSeconds, 330);
+    assert.deepEqual(e.participants, ['Alice', 'Bob']);
+    assert.equal(e.language, 'ko');
+  });
+
+  it('rebuilds from multiple .md files', async () => {
+    const { dir, cleanup: c } = await makeTempMinutesDir();
+    cleanup = c;
+
+    for (let i = 1; i <= 3; i++) {
+      await writeFile(join(dir, `minutes_2026-04-0${i}_100000_chan.md`), SAMPLE_MD, 'utf-8');
+    }
+
+    const index = await rebuildIndex();
+    assert.equal(index.entries.length, 3);
+  });
+
+  it('skips non-.md files in directory', async () => {
+    const { dir, cleanup: c } = await makeTempMinutesDir();
+    cleanup = c;
+
+    await writeFile(join(dir, 'index.json'), '{}', 'utf-8');
+    await writeFile(join(dir, 'notes.txt'), 'ignore me', 'utf-8');
+    await writeFile(join(dir, 'minutes_2026-04-01_100000_chan.md'), SAMPLE_MD, 'utf-8');
+
+    const index = await rebuildIndex();
+    assert.equal(index.entries.length, 1);
+  });
+
+  it('persists the rebuilt index to disk', async () => {
+    const { dir, cleanup: c } = await makeTempMinutesDir();
+    cleanup = c;
+
+    await writeFile(join(dir, 'minutes_2026-04-01_100000_chan.md'), SAMPLE_MD, 'utf-8');
+    await rebuildIndex();
+
+    const raw = await readFile(join(dir, 'index.json'), 'utf-8');
+    const persisted = JSON.parse(raw);
+    assert.equal(persisted.entries.length, 1);
+  });
+});
+
+describe('searchEntries (filter logic in isolated store)', () => {
+  let cleanup;
+
+  afterEach(async () => {
+    if (cleanup) { await cleanup(); cleanup = null; }
+  });
+
+  async function seedEntries() {
+    ({ cleanup } = await makeTempMinutesDir());
+    await addEntry(sampleEntryParams({
+      sessionId: 'session-a',
+      guildId: 'guild-1', channelName: 'general',
+      participants: ['Alice', 'Bob'],
+      startedAt: new Date('2026-03-01T10:00:00Z'),
+      language: 'en',
+    }));
+    await addEntry(sampleEntryParams({
+      sessionId: 'session-b',
+      guildId: 'guild-1', channelName: 'standup',
+      participants: ['Charlie', 'Dave'],
+      startedAt: new Date('2026-04-01T10:00:00Z'),
+      language: 'en',
+    }));
+    await addEntry(sampleEntryParams({
+      sessionId: 'session-c',
+      guildId: 'guild-2', channelName: '일반',
+      participants: ['철수', '영희'],
+      startedAt: new Date('2026-04-03T10:00:00Z'),
+      language: 'ko',
+    }));
+  }
+
+  it('returns all entries with no filters', async () => {
+    await seedEntries();
+    const result = await searchEntries();
+    assert.equal(result.total, 3);
+  });
+
+  it('returns entries sorted newest-first', async () => {
+    await seedEntries();
+    const result = await searchEntries();
+    assert.equal(result.entries[0].sessionId, 'session-c');
+    assert.equal(result.entries[1].sessionId, 'session-b');
+    assert.equal(result.entries[2].sessionId, 'session-a');
+  });
+
+  it('filters by exact sessionId', async () => {
+    await seedEntries();
+    const result = await searchEntries({ sessionId: 'session-b' });
+    assert.equal(result.total, 1);
+    assert.equal(result.entries[0].sessionId, 'session-b');
+  });
+
+  it('filters by guildId', async () => {
+    await seedEntries();
+    const result = await searchEntries({ guildId: 'guild-1' });
+    assert.equal(result.total, 2);
+    for (const e of result.entries) assert.equal(e.guildId, 'guild-1');
+  });
+
+  it('filters by channelName (partial, case-insensitive)', async () => {
+    await seedEntries();
+    const result = await searchEntries({ channelName: 'STAND' });
+    assert.equal(result.total, 1);
+    assert.equal(result.entries[0].sessionId, 'session-b');
+  });
+
+  it('filters by participant name (partial, case-insensitive)', async () => {
+    await seedEntries();
+    const result = await searchEntries({ participant: 'alice' });
+    assert.equal(result.total, 1);
+    assert.equal(result.entries[0].sessionId, 'session-a');
+  });
+
+  it('filters by participant name for Korean names', async () => {
+    await seedEntries();
+    const result = await searchEntries({ participant: '철수' });
+    assert.equal(result.total, 1);
+    assert.equal(result.entries[0].sessionId, 'session-c');
+  });
+
+  it('filters by dateFrom (inclusive)', async () => {
+    await seedEntries();
+    const result = await searchEntries({ dateFrom: '2026-04-01' });
+    assert.equal(result.total, 2);
+    for (const e of result.entries) assert.ok(e.date >= '2026-04-01');
+  });
+
+  it('filters by dateTo (inclusive)', async () => {
+    await seedEntries();
+    const result = await searchEntries({ dateTo: '2026-03-31' });
+    assert.equal(result.total, 1);
+    assert.equal(result.entries[0].sessionId, 'session-a');
+  });
+
+  it('filters by date range (dateFrom + dateTo)', async () => {
+    await seedEntries();
+    const result = await searchEntries({ dateFrom: '2026-04-01', dateTo: '2026-04-02' });
+    assert.equal(result.total, 1);
+    assert.equal(result.entries[0].sessionId, 'session-b');
+  });
+
+  it('filters by language', async () => {
+    await seedEntries();
+    const ko = await searchEntries({ language: 'ko' });
+    assert.equal(ko.total, 1);
+    assert.equal(ko.entries[0].sessionId, 'session-c');
+
+    const en = await searchEntries({ language: 'en' });
+    assert.equal(en.total, 2);
+  });
+
+  it('free-text query matches channelName', async () => {
+    await seedEntries();
+    const result = await searchEntries({ query: 'standup' });
+    assert.equal(result.total, 1);
+    assert.equal(result.entries[0].sessionId, 'session-b');
+  });
+
+  it('free-text query matches participant name', async () => {
+    await seedEntries();
+    const result = await searchEntries({ query: 'charlie' });
+    assert.equal(result.total, 1);
+    assert.equal(result.entries[0].sessionId, 'session-b');
+  });
+
+  it('free-text query matches guildName', async () => {
+    await seedEntries();
+    const result = await searchEntries({ query: 'Test Guild' });
+    assert.equal(result.total, 3); // all entries use 'Test Guild'
+  });
+
+  it('free-text query returns empty for no match', async () => {
+    await seedEntries();
+    const result = await searchEntries({ query: 'nonexistent-xyz-999' });
+    assert.equal(result.total, 0);
+  });
+
+  it('respects limit', async () => {
+    await seedEntries();
+    const result = await searchEntries({ limit: 2 });
+    assert.equal(result.showing, 2);
+    assert.equal(result.total, 3);
+  });
+
+  it('respects offset for pagination', async () => {
+    await seedEntries();
+    const page1 = await searchEntries({ limit: 1, offset: 0 });
+    const page2 = await searchEntries({ limit: 1, offset: 1 });
+    const page3 = await searchEntries({ limit: 1, offset: 2 });
+
+    assert.equal(page1.showing, 1);
+    assert.equal(page2.showing, 1);
+    assert.equal(page3.showing, 1);
+
+    const ids = [page1.entries[0].sessionId, page2.entries[0].sessionId, page3.entries[0].sessionId];
+    const unique = new Set(ids);
+    assert.equal(unique.size, 3); // all different
+  });
+
+  it('combines multiple filters (guildId + language)', async () => {
+    await seedEntries();
+    const result = await searchEntries({ guildId: 'guild-1', language: 'en' });
+    assert.equal(result.total, 2);
+  });
+
+  it('returns empty result when no entries match combined filters', async () => {
+    await seedEntries();
+    const result = await searchEntries({ guildId: 'guild-1', language: 'ko' });
+    assert.equal(result.total, 0);
+  });
+});
+
+// ===========================================================================
+// saveIndex atomic write
+// ===========================================================================
+
+describe('saveIndex (atomic write)', () => {
+  let cleanup;
+
+  afterEach(async () => {
+    if (cleanup) { await cleanup(); cleanup = null; }
+  });
+
+  it('does not leave a .tmp file after a successful save', async () => {
+    const { dir, cleanup: c } = await makeTempMinutesDir();
+    cleanup = c;
+
+    await saveIndex(createEmptyIndex());
+
+    const { readdir } = await import('node:fs/promises');
+    const files = await readdir(dir);
+    assert.ok(!files.some(f => f.endsWith('.tmp')), 'No .tmp file should remain after save');
+    assert.ok(files.includes('index.json'), 'index.json should exist after save');
+  });
+
+  it('overwrites existing index atomically', async () => {
+    ({ cleanup } = await makeTempMinutesDir());
+
+    const idx1 = createEmptyIndex();
+    idx1.entries.push({ sessionId: 'v1', date: '2026-01-01' });
+    await saveIndex(idx1);
+
+    const idx2 = createEmptyIndex();
+    idx2.entries.push({ sessionId: 'v2', date: '2026-02-01' });
+    await saveIndex(idx2);
+
+    const loaded = await loadIndex();
+    assert.equal(loaded.entries.length, 1);
+    assert.equal(loaded.entries[0].sessionId, 'v2');
+  });
+});
+
+// ===========================================================================
+// listDates
+// ===========================================================================
+
+describe('listDates', () => {
+  let cleanup;
+
+  afterEach(async () => {
+    if (cleanup) { await cleanup(); cleanup = null; }
+  });
+
+  async function seedDateEntries() {
+    ({ cleanup } = await makeTempMinutesDir());
+    // Three sessions: two on same date, one on a different date, different guilds
+    await addEntry(sampleEntryParams({
+      sessionId: 'date-a1',
+      guildId: 'guild-1',
+      channelName: 'general',
+      startedAt: new Date('2026-03-01T09:00:00Z'),
+    }));
+    await addEntry(sampleEntryParams({
+      sessionId: 'date-a2',
+      guildId: 'guild-1',
+      channelName: 'standup',
+      startedAt: new Date('2026-03-01T14:00:00Z'),
+    }));
+    await addEntry(sampleEntryParams({
+      sessionId: 'date-b1',
+      guildId: 'guild-2',
+      channelName: 'general',
+      startedAt: new Date('2026-04-05T10:00:00Z'),
+    }));
+  }
+
+  it('returns unique dates sorted newest-first', async () => {
+    await seedDateEntries();
+    const dates = await listDates();
+    assert.equal(dates.length, 2);
+    assert.equal(dates[0].date, '2026-04-05');
+    assert.equal(dates[1].date, '2026-03-01');
+  });
+
+  it('includes correct session counts per date', async () => {
+    await seedDateEntries();
+    const dates = await listDates();
+    const march = dates.find(d => d.date === '2026-03-01');
+    assert.equal(march.count, 2);
+    const april = dates.find(d => d.date === '2026-04-05');
+    assert.equal(april.count, 1);
+  });
+
+  it('includes channel names for each date', async () => {
+    await seedDateEntries();
+    const dates = await listDates();
+    const march = dates.find(d => d.date === '2026-03-01');
+    assert.ok(march.channelNames.includes('general'));
+    assert.ok(march.channelNames.includes('standup'));
+    assert.equal(march.channelNames.length, 2);
+  });
+
+  it('includes session IDs for each date', async () => {
+    await seedDateEntries();
+    const dates = await listDates();
+    const march = dates.find(d => d.date === '2026-03-01');
+    assert.ok(march.sessionIds.includes('date-a1'));
+    assert.ok(march.sessionIds.includes('date-a2'));
+  });
+
+  it('filters by guildId', async () => {
+    await seedDateEntries();
+    const dates = await listDates('guild-1');
+    assert.equal(dates.length, 1);
+    assert.equal(dates[0].date, '2026-03-01');
+    assert.equal(dates[0].count, 2);
+  });
+
+  it('returns empty array when index is empty', async () => {
+    ({ cleanup } = await makeTempMinutesDir());
+    const dates = await listDates();
+    assert.deepEqual(dates, []);
+  });
+
+  it('deduplicates channel names per date', async () => {
+    ({ cleanup } = await makeTempMinutesDir());
+    // Two sessions on same date in the same channel
+    await addEntry(sampleEntryParams({ sessionId: 'dup-1', channelName: 'general', startedAt: new Date('2026-05-01T09:00:00Z') }));
+    await addEntry(sampleEntryParams({ sessionId: 'dup-2', channelName: 'general', startedAt: new Date('2026-05-01T15:00:00Z') }));
+
+    const dates = await listDates();
+    assert.equal(dates[0].channelNames.length, 1);
+    assert.equal(dates[0].channelNames[0], 'general');
+  });
+});
+
+// ===========================================================================
+// listChannels
+// ===========================================================================
+
+describe('listChannels', () => {
+  let cleanup;
+
+  afterEach(async () => {
+    if (cleanup) { await cleanup(); cleanup = null; }
+  });
+
+  async function seedChannelEntries() {
+    ({ cleanup } = await makeTempMinutesDir());
+    await addEntry(sampleEntryParams({
+      sessionId: 'ch-a1',
+      guildId: 'guild-1', guildName: 'Server A',
+      channelName: 'general',
+      startedAt: new Date('2026-02-01T09:00:00Z'),
+    }));
+    await addEntry(sampleEntryParams({
+      sessionId: 'ch-a2',
+      guildId: 'guild-1', guildName: 'Server A',
+      channelName: 'general',
+      startedAt: new Date('2026-04-10T09:00:00Z'),
+    }));
+    await addEntry(sampleEntryParams({
+      sessionId: 'ch-b1',
+      guildId: 'guild-1', guildName: 'Server A',
+      channelName: 'standup',
+      startedAt: new Date('2026-03-15T09:00:00Z'),
+    }));
+    await addEntry(sampleEntryParams({
+      sessionId: 'ch-c1',
+      guildId: 'guild-2', guildName: 'Server B',
+      channelName: 'general',
+      startedAt: new Date('2026-01-20T09:00:00Z'),
+    }));
+  }
+
+  it('returns unique channel entries sorted by most-recent activity', async () => {
+    await seedChannelEntries();
+    const channels = await listChannels();
+    // guild-1/general last active 2026-04-10, guild-1/standup 2026-03-15, guild-2/general 2026-01-20
+    assert.equal(channels[0].channelName, 'general');
+    assert.equal(channels[0].guildId, 'guild-1');
+    assert.equal(channels[0].lastDate, '2026-04-10');
+  });
+
+  it('includes correct session counts per channel', async () => {
+    await seedChannelEntries();
+    const channels = await listChannels();
+    const g1General = channels.find(c => c.guildId === 'guild-1' && c.channelName === 'general');
+    assert.equal(g1General.count, 2);
+    const standup = channels.find(c => c.channelName === 'standup');
+    assert.equal(standup.count, 1);
+  });
+
+  it('tracks firstDate and lastDate for each channel', async () => {
+    await seedChannelEntries();
+    const channels = await listChannels();
+    const g1General = channels.find(c => c.guildId === 'guild-1' && c.channelName === 'general');
+    assert.equal(g1General.firstDate, '2026-02-01');
+    assert.equal(g1General.lastDate, '2026-04-10');
+  });
+
+  it('treats same channel name in different guilds as distinct entries', async () => {
+    await seedChannelEntries();
+    const channels = await listChannels();
+    const generals = channels.filter(c => c.channelName === 'general');
+    assert.equal(generals.length, 2);
+  });
+
+  it('filters by guildId', async () => {
+    await seedChannelEntries();
+    const channels = await listChannels('guild-2');
+    assert.equal(channels.length, 1);
+    assert.equal(channels[0].guildId, 'guild-2');
+    assert.equal(channels[0].channelName, 'general');
+  });
+
+  it('includes session IDs per channel', async () => {
+    await seedChannelEntries();
+    const channels = await listChannels('guild-1');
+    const g1General = channels.find(c => c.channelName === 'general');
+    assert.ok(g1General.sessionIds.includes('ch-a1'));
+    assert.ok(g1General.sessionIds.includes('ch-a2'));
+  });
+
+  it('returns empty array when index is empty', async () => {
+    ({ cleanup } = await makeTempMinutesDir());
+    const channels = await listChannels();
+    assert.deepEqual(channels, []);
+  });
+});
+
+// ===========================================================================
+// getByDateChannel
+// ===========================================================================
+
+describe('getByDateChannel', () => {
+  let cleanup;
+
+  afterEach(async () => {
+    if (cleanup) { await cleanup(); cleanup = null; }
+  });
+
+  async function seedDCEntries() {
+    ({ cleanup } = await makeTempMinutesDir());
+    await addEntry(sampleEntryParams({
+      sessionId: 'dc-1',
+      guildId: 'guild-1',
+      channelName: 'general',
+      startedAt: new Date('2026-04-01T09:00:00Z'),
+    }));
+    await addEntry(sampleEntryParams({
+      sessionId: 'dc-2',
+      guildId: 'guild-1',
+      channelName: 'standup',
+      startedAt: new Date('2026-04-01T11:00:00Z'),
+    }));
+    await addEntry(sampleEntryParams({
+      sessionId: 'dc-3',
+      guildId: 'guild-1',
+      channelName: 'general',
+      startedAt: new Date('2026-04-01T15:00:00Z'),
+    }));
+    await addEntry(sampleEntryParams({
+      sessionId: 'dc-4',
+      guildId: 'guild-2',
+      channelName: 'general',
+      startedAt: new Date('2026-04-02T09:00:00Z'),
+    }));
+  }
+
+  it('returns all sessions on a given date when no channel specified', async () => {
+    await seedDCEntries();
+    const results = await getByDateChannel('2026-04-01');
+    assert.equal(results.length, 3);
+  });
+
+  it('filters by channel name (partial, case-insensitive)', async () => {
+    await seedDCEntries();
+    const results = await getByDateChannel('2026-04-01', 'GENERAL');
+    assert.equal(results.length, 2);
+    for (const r of results) assert.equal(r.channelName, 'general');
+  });
+
+  it('returns empty array when date has no sessions', async () => {
+    await seedDCEntries();
+    const results = await getByDateChannel('2026-01-01');
+    assert.deepEqual(results, []);
+  });
+
+  it('returns empty array when channel has no sessions on that date', async () => {
+    await seedDCEntries();
+    const results = await getByDateChannel('2026-04-01', 'nonexistent-channel');
+    assert.deepEqual(results, []);
+  });
+
+  it('sorts results by start time ascending within a day', async () => {
+    await seedDCEntries();
+    const results = await getByDateChannel('2026-04-01', 'general');
+    assert.equal(results[0].sessionId, 'dc-1');
+    assert.equal(results[1].sessionId, 'dc-3');
+  });
+
+  it('filters by guildId when provided', async () => {
+    await seedDCEntries();
+    const results = await getByDateChannel('2026-04-01', 'general', 'guild-1');
+    assert.equal(results.length, 2);
+    for (const r of results) assert.equal(r.guildId, 'guild-1');
+  });
+
+  it('throws TypeError when date is not provided', async () => {
+    ({ cleanup } = await makeTempMinutesDir());
+    await assert.rejects(
+      () => getByDateChannel(undefined),
+      TypeError
+    );
+  });
+
+  it('exact date match only — different date returns empty', async () => {
+    await seedDCEntries();
+    const results = await getByDateChannel('2026-04-02', 'general', 'guild-1');
+    assert.deepEqual(results, []); // dc-4 is guild-2
+  });
+});
+
+// ===========================================================================
+// getIndexStats
+// ===========================================================================
+
+describe('getIndexStats', () => {
+  let cleanup;
+
+  afterEach(async () => {
+    if (cleanup) { await cleanup(); cleanup = null; }
+  });
+
+  async function seedStatsEntries() {
+    ({ cleanup } = await makeTempMinutesDir());
+    await addEntry(sampleEntryParams({
+      sessionId: 'st-1',
+      guildId: 'guild-1', channelName: 'general',
+      startedAt: new Date('2026-01-10T09:00:00Z'),
+      durationSeconds: 600,
+      language: 'en',
+    }));
+    await addEntry(sampleEntryParams({
+      sessionId: 'st-2',
+      guildId: 'guild-1', channelName: 'standup',
+      startedAt: new Date('2026-03-20T14:00:00Z'),
+      durationSeconds: 1200,
+      language: 'en',
+    }));
+    await addEntry(sampleEntryParams({
+      sessionId: 'st-3',
+      guildId: 'guild-2', channelName: 'general',
+      startedAt: new Date('2026-04-05T10:00:00Z'),
+      durationSeconds: 300,
+      language: 'ko',
+    }));
+  }
+
+  it('returns zero stats for empty index', async () => {
+    ({ cleanup } = await makeTempMinutesDir());
+    const stats = await getIndexStats();
+    assert.equal(stats.totalSessions, 0);
+    assert.equal(stats.totalDurationSeconds, 0);
+    assert.equal(stats.earliestDate, null);
+    assert.equal(stats.latestDate, null);
+    assert.equal(stats.uniqueDates, 0);
+    assert.equal(stats.uniqueChannels, 0);
+    assert.equal(stats.uniqueGuilds, 0);
+    assert.deepEqual(stats.languages, []);
+  });
+
+  it('returns correct totals across all entries', async () => {
+    await seedStatsEntries();
+    const stats = await getIndexStats();
+    assert.equal(stats.totalSessions, 3);
+    assert.equal(stats.totalDurationSeconds, 600 + 1200 + 300);
+  });
+
+  it('reports correct date range', async () => {
+    await seedStatsEntries();
+    const stats = await getIndexStats();
+    assert.equal(stats.earliestDate, '2026-01-10');
+    assert.equal(stats.latestDate, '2026-04-05');
+  });
+
+  it('counts unique dates', async () => {
+    await seedStatsEntries();
+    const stats = await getIndexStats();
+    assert.equal(stats.uniqueDates, 3);
+  });
+
+  it('counts unique channels', async () => {
+    await seedStatsEntries();
+    const stats = await getIndexStats();
+    // 'general' (guild-1), 'standup' (guild-1), 'general' (guild-2) — but channel name set ignores guild
+    assert.equal(stats.uniqueChannels, 2); // 'general' and 'standup'
+  });
+
+  it('counts unique guilds', async () => {
+    await seedStatsEntries();
+    const stats = await getIndexStats();
+    assert.equal(stats.uniqueGuilds, 2);
+  });
+
+  it('lists distinct language codes sorted', async () => {
+    await seedStatsEntries();
+    const stats = await getIndexStats();
+    assert.deepEqual(stats.languages, ['en', 'ko']);
+  });
+
+  it('filters by guildId', async () => {
+    await seedStatsEntries();
+    const stats = await getIndexStats('guild-1');
+    assert.equal(stats.totalSessions, 2);
+    assert.equal(stats.uniqueGuilds, 1);
+    assert.equal(stats.totalDurationSeconds, 600 + 1200);
+    assert.deepEqual(stats.languages, ['en']);
+  });
+
+  it('includes indexUpdatedAt from the index', async () => {
+    await seedStatsEntries();
+    const stats = await getIndexStats();
+    assert.ok(typeof stats.indexUpdatedAt === 'string');
+    assert.ok(stats.indexUpdatedAt.length > 0);
   });
 });
