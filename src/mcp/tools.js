@@ -44,6 +44,7 @@ import {
   SEARCH_MEETING_MINUTES_SHAPE,
   SUMMARIZE_MINUTES_SHAPE,
   GET_MEETING_MINUTES_SHAPE,
+  TRANSCRIBE_AUDIO_FILE_SHAPE,
 } from './schemas.js';
 import {
   joinVoiceChannel,
@@ -60,6 +61,7 @@ import {
   searchMeetingMinutes,
   summarizeMinutes,
   getPreviousMinutes,
+  transcribeAudioFile,
 } from './handlers.js';
 
 /**
@@ -179,5 +181,14 @@ export function registerTools(server, deps) {
     'Retrieve stored meeting minutes as fully structured JSON data. Accepts optional filters for session ID, date range (date_from/date_to in YYYY-MM-DD format), channel name, participant, guild, keywords, and language. Returns each matching minutes file parsed into structured fields: summary, key_discussion_points, action_items (with task/assignee/deadline), decisions, attendees, and statistics. Optionally includes raw_markdown or full transcript entries. Results are ordered newest-first and support limit/offset pagination. Use this to programmatically access and analyse past meeting records without reading raw markdown.',
     GET_MEETING_MINUTES_SHAPE,
     async (params) => getPreviousMinutes(deps, params)
+  );
+
+  // --- Whisper Batch STT Tool ---
+
+  server.tool(
+    'transcribe_audio_file',
+    'Transcribe an audio file using the Whisper API (batch mode). Accepts a file path to an audio file (wav, mp3, ogg, webm, m4a) and returns the transcribed text with language detection and timing info. Uses the external Whisper API configured via WHISPER_API_URL with Cloudflare Access authentication. Processing time is approximately 3x the audio duration.',
+    TRANSCRIBE_AUDIO_FILE_SHAPE,
+    async ({ file_path, language, model }) => transcribeAudioFile(deps, file_path, language, model)
   );
 }

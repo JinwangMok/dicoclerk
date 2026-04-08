@@ -242,6 +242,18 @@ export const SummarizeMinutesInputSchema = z.object(SUMMARIZE_MINUTES_SHAPE);
 export const GetMeetingMinutesInputSchema = z.object(GET_MEETING_MINUTES_SHAPE);
 
 // ---------------------------------------------------------------------------
+// Whisper batch STT tool
+// ---------------------------------------------------------------------------
+
+export const TRANSCRIBE_AUDIO_FILE_SHAPE = {
+  file_path: z.string().min(1, 'must be a non-empty file path').describe('Absolute path to the audio file to transcribe (wav, mp3, ogg, webm, m4a)'),
+  language: z.enum(['ko', 'en', 'multi']).optional().describe('Language hint for transcription (default: auto-detect)'),
+  model: z.string().optional().describe('Whisper model name (default: large-v3-turbo)'),
+};
+
+export const TranscribeAudioFileInputSchema = z.object(TRANSCRIBE_AUDIO_FILE_SHAPE);
+
+// ---------------------------------------------------------------------------
 // Output schemas — describe the JSON object inside content[0].text
 // (used for response validation in tests and the validator utility)
 // ---------------------------------------------------------------------------

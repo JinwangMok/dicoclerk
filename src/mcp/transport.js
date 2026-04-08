@@ -143,11 +143,13 @@ export async function startSseServer(server, port = 3000) {
   });
 
   await new Promise((resolve, reject) => {
-    httpServer.listen(port, '127.0.0.1', () => resolve(undefined));
+    const host = process.env.MCP_HOST || '127.0.0.1';
+    httpServer.listen(port, host, () => resolve(undefined));
     httpServer.on('error', reject);
   });
 
-  console.log(`[MCP-SSE] Server listening on http://127.0.0.1:${port}/sse`);
+  const boundHost = process.env.MCP_HOST || '127.0.0.1';
+  console.log(`[MCP-SSE] Server listening on http://${boundHost}:${port}/sse`);
 
   /**
    * Close the HTTP server and all active SSE connections.

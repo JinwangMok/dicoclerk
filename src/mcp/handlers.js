@@ -23,6 +23,8 @@ import {
   validatePositiveInt,
 } from './validator.js';
 
+import { createReadStream, existsSync } from 'fs';
+
 const DATA_DIR = join(process.cwd(), 'data');
 const TRANSCRIPTS_DIR = join(DATA_DIR, 'transcripts');
 const MINUTES_DIR = join(DATA_DIR, 'minutes');
@@ -1390,5 +1392,112 @@ async function findTranscriptFiles(guildId) {
     return withStats.map(f => f.path);
   } catch {
     return [];
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Whisper batch STT
+// ---------------------------------------------------------------------------
+
+/**
+ * Transcribe an audio file using the Whisper API (batch mode).
+ *
+ * @param {object} _deps - App dependencies (unused for this tool)
+ * @param {string} filePath - Absolute path to the audio file
+ * @param {string} [language] - Language hint (ko, en, multi)
+ * @param {string} [model] - Whisper model name
+ */
+export async function transcribeAudioFile(_deps, filePath, language, model) {
+  const apiUrl = process.env.WHISPER_API_URL
+    || 'https://stt.agentic-ai-gist.org/stt/v1/audio/transcriptions';
+  const clientId = process.env.CF_ACCESS_CLIENT_ID;
+  const clientSecret = process.env.CF_ACCESS_CLIENT_SECRET;
+
+  if (!clientId || !clientSecret) {
+    return {
+      content: [{ type: 'text', text: JSON.stringify({
+        error: 'CF-Access credentials not configured. Set CF_ACCESS_CLIENT_ID and CF_ACCESS_CLIENT_SECRET in .env',
+      }) }],
+    };
+  }
+
+  // Validate file exists
+  const { existsSync } = await import('fs');
+  const { stat: statAsync } = await import('fs/promises');
+
+  if (!existsSync(filePath)) {
+    return {
+      content: [{ type: 'text', text: JSON.stringify({
+        error: `File not found: ${filePath}`,
+      }) }],
+    };
+  }
+
+  const fileStats = await statAsync(filePath);
+  const fileSizeMB = fileStats.size / (1024 * 1024);
+
+  try {
+    // Build multipart form data using Node.js built-in Blob/File
+    const { readFile: readFileAsync } = await import('fs/promises');
+    const fileBuffer = await readFileAsync(filePath);
+    const { basename } = await import('path');
+    const fileName = basename(filePath);
+
+    const formData = new FormData();
+    formData.append('file', new Blob([fileBuffer]), fileName);
+    formData.append('model', model || 'large-v3-turbo');
+    if (language && language !== 'multi') {
+      formData.append('language', language);
+    }
+
+    // Timeout: conservative 4x estimate based on ~3x processing time
+    const estimatedDurationSec = fileSizeMB * 10; // rough: 1MB ≈ 10s audio
+    const timeoutMs = Math.max(60_000, estimatedDurationSec * 4 * 1000);
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+    const response = await fetch(apiUrl, {
+      method: 'POST',
+      headers: {
+        'CF-Access-Client-Id': clientId,
+        'CF-Access-Client-Secret': clientSecret,
+        'User-Agent': 'dicoclerk/1.0',
+      },
+      body: formData,
+      signal: controller.signal,
+    });
+
+    clearTimeout(timer);
+
+    if (!response.ok) {
+      const body = await response.text().catch(() => '');
+      return {
+        content: [{ type: 'text', text: JSON.stringify({
+          error: `Whisper API returned ${response.status}: ${body}`,
+        }) }],
+      };
+    }
+
+    const result = await response.json();
+
+    return {
+      content: [{ type: 'text', text: JSON.stringify({
+        text: result.text || '',
+        language: result.language || 'unknown',
+        duration: result.duration || null,
+        processing_time: result.processing_time || null,
+        file_path: filePath,
+        file_size_mb: Math.round(fileSizeMB * 100) / 100,
+        model: model || 'large-v3-turbo',
+      }) }],
+    };
+  } catch (err) {
+    const message = err.name === 'AbortError'
+      ? `Whisper API request timed out (file: ${fileSizeMB.toFixed(1)}MB)`
+      : `Whisper API error: ${err.message}`;
+    return {
+      content: [{ type: 'text', text: JSON.stringify({ error: message }) }],
+    };
   }
 }

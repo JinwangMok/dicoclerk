@@ -1,0 +1,12 @@
+node_modules/
+.env
+data/
+.git/
+.omc/
+tests/
+*.wav
+__pycache__/
+.pytest_cache/
+src/stt/*.py
+src/stt/__pycache__/
+tests/__pycache__/

@@ -38,6 +38,6 @@ export async function startBotMcp(client, sessionManager) {
 
   const server = createMcpServer({ client, sessionManager });
   const handle = await startSseServer(server, PORT);
-  console.log(`✅ MCP server (SSE) running on http://127.0.0.1:${PORT}/sse`);
+  console.log(`✅ MCP server (SSE) running on http://${process.env.MCP_HOST || '127.0.0.1'}:${PORT}/sse`);
   return handle;
 }
