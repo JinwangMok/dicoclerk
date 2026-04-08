@@ -81,17 +81,17 @@ prompt_value() {
     if [[ -n "$default_val" ]]; then
         if [[ "$is_secret" == "true" && ${#default_val} -gt 8 ]]; then
             local masked="${default_val:0:4}...${default_val: -4}"
-            echo -en "  ${prompt_text} [${masked}]: "
+            echo -en "  ${prompt_text} [${masked}]: " >&2
         else
-            echo -en "  ${prompt_text} [${default_val}]: "
+            echo -en "  ${prompt_text} [${default_val}]: " >&2
         fi
     else
-        echo -en "  ${prompt_text}: "
+        echo -en "  ${prompt_text}: " >&2
     fi
 
     if [[ "$is_secret" == "true" ]]; then
         read -rs result
-        echo ""   # newline after silent input
+        echo "" >&2   # newline after silent input
     else
         read -r result
     fi
