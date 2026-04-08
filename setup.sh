@@ -48,6 +48,9 @@ if [[ -f "$ENV_FILE" ]]; then
     echo ""
     # Source existing values safely
     while IFS='=' read -r key value; do
+        # Strip trailing \r from Windows line endings
+        key="${key%$'\r'}"
+        value="${value%$'\r'}"
         # Skip comments and empty lines
         [[ "$key" =~ ^#.*$ || -z "$key" ]] && continue
         # Trim whitespace
@@ -92,6 +95,8 @@ prompt_value() {
     else
         read -r result
     fi
+    # Strip trailing \r from Windows line endings
+    result="${result%$'\r'}"
     if [[ -z "$result" ]]; then
         result="$default_val"
     fi
