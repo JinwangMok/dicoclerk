@@ -1,0 +1,6 @@
+{
+  "slug": "report-to-pdf",
+  "version": "1.0.0",
+  "name": "Report to PDF",
+  "description": "Convert meeting report Markdown files to PDF using pandoc"
+}

@@ -1,0 +1,6 @@
+{
+  "slug": "send-to-discord",
+  "version": "1.0.0",
+  "name": "Send Report to Discord",
+  "description": "Send meeting report PDFs to a configured Discord channel"
+}

@@ -1,0 +1,6 @@
+{
+  "slug": "transcript-to-report",
+  "version": "1.0.0",
+  "name": "Transcript to Report",
+  "description": "Convert meeting transcripts into structured reports with summaries, action items, and decisions"
+}
