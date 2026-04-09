@@ -5,7 +5,7 @@ WORKDIR /app
 
 # WORKDIR=/app is required: process.cwd() data path resolution depends on this
 COPY package.json package-lock.json ./
-RUN npm ci --omit=dev
+RUN npm install --omit=dev
 
 COPY src/ ./src/
 
